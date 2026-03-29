@@ -37,7 +37,7 @@ export const tjaTokensProvider: languages.IMonarchLanguage = {
       [/[4]/, 'note.bigka'],        // Big Ka
       [/[5]/, 'note.roll'],         // Roll start
       [/[6]/, 'note.bigroll'],      // Big roll start
-      [/[7]/, 'note.balloon'],      // Balloon
+      [/[79]/, 'note.balloon'],      // Balloon / Kusudama
       [/[8]/, 'note.end'],          // End marker
       [/[9]/, 'note.kusudama'],     // Kusudama
       [/[0]/, 'note.empty'],        // Empty

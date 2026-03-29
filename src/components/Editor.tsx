@@ -56,6 +56,16 @@ const BASE_LEAD_IN_MEASURES = 1
 const NEGATIVE_LEAD_PADDING_MEASURES = 2 // buffer before chart start, per request
 const AUDIO_START_BASE_SECONDS = 0 // base audio start time; extendable if audio file has extra lead-in
 const PLAYBACK_START_PREROLL_SECONDS = 0.05 // start slightly earlier to avoid edge-note miss at play boundary
+const DEFAULT_CHART_METADATA: TjaMetadata = {
+  title: '',
+  subtitle: '',
+  offset: 0,
+  difficulty: 'Oni',
+  level: 10,
+  sevol: 100,
+  songvol: 100,
+  audio_url: null
+}
 
 const withCacheBuster = (url: string) => {
   try {
@@ -118,16 +128,7 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
   const [presenceNotices, setPresenceNotices] = useState<{ id: string, message: string, color: string }[]>([])
 
   // Metadata States
-  const [metadata, setMetadata] = useState<TjaMetadata>({
-    title: '',
-    subtitle: '',
-    offset: 0,
-    difficulty: 'Oni',
-    level: 10,
-    sevol: 100,
-    songvol: 100,
-    audio_url: null
-  })
+  const [metadata, setMetadata] = useState<TjaMetadata>({ ...DEFAULT_CHART_METADATA })
 
   const initialBpmCmd = commands.find(c => c.type === 'BPM' && c.measure === 0 && c.position === 0)
   const initialBpmValue = parseFloat(initialBpmCmd?.value || '120')
@@ -449,35 +450,47 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
     return { measure: mIdx - leadInMeasures, pos: p + fraction }
   }, [measureInfos, metadata.offset, leadInMeasures])
 
-  const centerScrollOnX = useCallback((targetX: number) => {
+  const centerScrollOnX = useCallback((targetX: number, smooth = false) => {
     const container = containerRef.current
     if (!container) return
     const halfWidth = container.clientWidth / 2
     const maxScroll = Math.max(0, container.scrollWidth - container.clientWidth)
     const desiredScrollLeft = Math.round(Math.min(maxScroll, Math.max(0, targetX - halfWidth)))
 
-    // Prevent tiny oscillations from sub-pixel seek updates that cause visual blur/afterimage.
-    if (Math.abs(desiredScrollLeft - lastAutoScrollLeftRef.current) < 2) return
+    if (!smooth) {
+      // Prevent tiny oscillations from sub-pixel seek updates that cause visual blur/afterimage.
+      if (Math.abs(desiredScrollLeft - lastAutoScrollLeftRef.current) < 2) return
+    }
     lastAutoScrollLeftRef.current = desiredScrollLeft
-    container.scrollLeft = desiredScrollLeft
+    if (smooth) {
+      container.scrollTo({ left: desiredScrollLeft, behavior: 'smooth' })
+    } else {
+      container.scrollLeft = desiredScrollLeft
+    }
   }, [])
 
-  const centerScrollOnSeek = useCallback((seek: number) => {
+  const centerScrollOnSeek = useCallback((seek: number, smooth = false) => {
     const measure = Math.floor(seek)
     const position = (seek - measure) * GRID_DIVISIONS
     const targetX = getX(measure, position)
-    centerScrollOnX(targetX)
+    centerScrollOnX(targetX, smooth)
   }, [getX, centerScrollOnX])
 
-  const jumpToChartStart = useCallback(() => {
+  const jumpToChartStart = useCallback((smoothScroll = false) => {
     if (audioEngine.isPlaying) {
       audioEngine.stop()
       setIsPlaying(false)
     }
     const startPos = 0
     setSeekPos(startPos)
-    centerScrollOnSeek(startPos)
+    centerScrollOnSeek(startPos, smoothScroll)
   }, [centerScrollOnSeek])
+
+  const handleBackClick = useCallback(() => {
+    audioEngine.stop()
+    setIsPlaying(false)
+    onBack()
+  }, [onBack])
 
   const stateRef = useRef({ notes, selectedNotes, clipboard, hoverGridObj, snapDivisions, commands, draggingEndpointId, isDraggingNotes, dragStartGrid, originalDraggingNotes, metadata, getAbsoluteTime })
   useEffect(() => {
@@ -624,6 +637,7 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
     { id: '5', label: '連打始', color: '#ffcc00', size: 1 },
     { id: '6', label: '大連打', color: '#ffcc00', size: 1.5 },
     { id: '7', label: '風船', color: '#ff9900', size: 1.2 },
+    { id: '9', label: 'くすだま', color: '#ff9900', size: 1.6 },
   ]
 
   // Initialize Data
@@ -942,6 +956,12 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
     void channelRef.current.track({ userId, userName, userColor, seekPos })
   }, [seekPos, userId, userName, userColor])
 
+  useEffect(() => {
+    return () => {
+      audioEngine.stop()
+    }
+  }, [])
+
   // --- Audio Handling ---
   useEffect(() => {
     if (!audioUrl) return
@@ -1065,6 +1085,12 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
       setIsPlaying(true)
     }
   }, [isPlaying, seekPos, getAbsoluteTime])
+
+  useEffect(() => {
+    if (!isPlaying) {
+      noteHitAnimRef.current.clear()
+    }
+  }, [isPlaying])
 
   // Playback loop to update seekPos synced with audio drift & Auto Scroll
   useLayoutEffect(() => {
@@ -1209,7 +1235,7 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
 
       if ((e.ctrlKey || e.metaKey) && key === 'arrowleft') {
         e.preventDefault()
-        jumpToChartStart()
+        jumpToChartStart(true)
         return
       }
 
@@ -1242,7 +1268,7 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
 
         for (const note of targetNotes) {
           const absTarget = note.measure * GRID_DIVISIONS + note.position;
-          if (['5', '6', '7'].includes(note.type)) {
+          if (['5', '6', '7', '9'].includes(note.type)) {
             // Find next 8
             for (const n of sorted) {
               const abs = n.measure * GRID_DIVISIONS + n.position;
@@ -1257,7 +1283,7 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
             for (const n of sorted) {
               const abs = n.measure * GRID_DIVISIONS + n.position;
               if (abs >= absTarget) break;
-              if (['5', '6', '7'].includes(n.type)) {
+              if (['5', '6', '7', '9'].includes(n.type)) {
                 lastStartId = n.id;
               } else if (n.type === '8') {
                 lastStartId = null;
@@ -1389,7 +1415,7 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
 
 
       // Type Selection
-      if (e.key >= '1' && e.key <= '7') setSelectedType(e.key)
+      if ((e.key >= '1' && e.key <= '7') || e.key === '9') setSelectedType(e.key)
       else if (e.key === '0') setSelectedType('0')
 
       // Playback toggle
@@ -1492,80 +1518,30 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
       ctx.lineTo(visibleEndX, laneCenterY)
       ctx.stroke()
 
-      // Optimized Waveform Drawing
+      // Waveform Drawing (density anchored to screen-space columns)
       if (waveformPeaks.length > 0 && audioEngine.audioBuffer) {
         const duration = audioEngine.audioBuffer.duration
         const waveformY = HEADER_HEIGHT + LANE_HEIGHT - WAVEFORM_HEIGHT
-        const measure0Info = getMeasureInfo(0)
 
         ctx.fillStyle = 'rgba(255, 255, 255, 0.35)'
-        // Avoid alpha stacking by merging bars that land on the same pixel column.
-        const waveformColumnMax = new Map<number, number>()
+        const waveformSamples: Array<{ col: number, h: number }> = []
+        // Sample at fixed on-screen spacing so density stays uniform regardless of HS/scroll speed.
+        for (let col = Math.floor(visibleStartX); col <= Math.ceil(visibleEndX); col += 2) {
+          const grid = getGridFromX(col)
+          const chartTime = getAbsoluteTime(grid.rawMeasure, grid.rawPos)
+          const audioTime = chartTime - metadata.offset
+          if (!Number.isFinite(audioTime) || audioTime < 0 || audioTime > duration) continue
 
-        const startMIdx = measureOffsets.findIndex(o => o >= visibleStartX)
-        const endMIdx = measureOffsets.findIndex(o => o >= visibleEndX)
-        const effectiveStartIdx = startMIdx === -1 ? 0 : Math.max(0, startMIdx - 1)
-        const effectiveEndIdx = endMIdx === -1 ? measureOffsets.length - 1 : endMIdx
-
-        for (let i = effectiveStartIdx; i <= effectiveEndIdx; i++) {
-          const mInfo = measureInfos[i]
-          if (!mInfo) continue
-
-          const mWidth = mInfo.totalWidth
-          if (mInfo.offsetX + mWidth < visibleStartX || mInfo.offsetX > visibleEndX) continue
-
-          // Audio range for this measure:
-          // musicTime = chartTime - offset
-          // chartTimeOfMeasureStart = startTime - measure0StartTime
-          const chartTimeStart = mInfo.startTime - measure0Info.startTime
-          const audioStartTime = chartTimeStart - metadata.offset
-          const audioEndTime = audioStartTime + mInfo.duration
-
-          const startRatio = Math.max(0, Math.min(1, audioStartTime / duration))
-          const endRatio = Math.max(0, Math.min(1, audioEndTime / duration))
-
-          const startPeakIdx = Math.floor(startRatio * waveformPeaks.length)
-          const endPeakIdx = Math.ceil(endRatio * waveformPeaks.length)
-
-          const pxPerPeak = (mWidth / Math.max(1, endPeakIdx - startPeakIdx))
-          const step = pxPerPeak < 1 ? Math.ceil(1 / pxPerPeak) : 1
-
-          for (let j = startPeakIdx; j < endPeakIdx; j += step) {
-            const val = waveformPeaks[j]
-            const audioTime = (j / waveformPeaks.length) * duration
-
-            // chartTime = audioTime + offset
-            const chartTime = audioTime + metadata.offset
-            const absoluteDisplayTime = chartTime + measure0Info.startTime
-            const localTime = absoluteDisplayTime - mInfo.startTime
-
-            let p = 0
-            if (localTime <= 0) p = 0
-            else if (localTime >= mInfo.duration) p = GRID_DIVISIONS
-            else {
-              let est = Math.floor((localTime / mInfo.duration) * GRID_DIVISIONS)
-              p = est
-              if (mInfo.timeOffsets[p] < localTime) {
-                while (p < GRID_DIVISIONS && mInfo.timeOffsets[p + 1] < localTime) p++
-              } else {
-                while (p > 0 && mInfo.timeOffsets[p] > localTime) p--
-              }
-            }
-
-            const t0 = mInfo.timeOffsets[p], t1 = mInfo.timeOffsets[p + 1] || t0
-            const f = t1 > t0 ? (localTime - t0) / (t1 - t0) : 0
-            const x = mInfo.offsetX + mInfo.posOffsets[p] + f * ((mInfo.posOffsets[p + 1] || mInfo.posOffsets[p]) - mInfo.posOffsets[p])
-
-            if (x >= visibleStartX && x <= visibleEndX) {
-              const h = Math.max(2, val * WAVEFORM_HEIGHT)
-              const col = Math.round(x)
-              const prev = waveformColumnMax.get(col) ?? 0
-              if (h > prev) waveformColumnMax.set(col, h)
-            }
-          }
+          const peakIdx = Math.max(0, Math.min(
+            waveformPeaks.length - 1,
+            Math.floor((audioTime / duration) * waveformPeaks.length)
+          ))
+          const val = waveformPeaks[peakIdx]
+          const h = Math.max(2, val * WAVEFORM_HEIGHT)
+          waveformSamples.push({ col, h })
         }
 
-        waveformColumnMax.forEach((h, col) => {
+        waveformSamples.forEach(({ col, h }) => {
           ctx.fillRect(col - 1, waveformY + (WAVEFORM_HEIGHT - h) / 2, 2, h)
         })
       }
@@ -1691,7 +1667,7 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
       let currentRollStart: Note | null = null;
       const currentSeekAbs = seekPos * GRID_DIVISIONS
       for (const n of sortedNotes) {
-        if (['5', '6', '7'].includes(n.type)) {
+        if (['5', '6', '7', '9'].includes(n.type)) {
           currentRollStart = n;
         } else if (n.type === '8' && currentRollStart) {
           const startX = getX(currentRollStart.measure, currentRollStart.position)
@@ -1703,7 +1679,7 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
             if (currentRollStart.type === '6') {
               color = 'rgba(255, 204, 0, 0.6)';
               height = BASE_NOTE_RADIUS * 3 * 0.8;
-            } else if (currentRollStart.type === '7') {
+            } else if (currentRollStart.type === '7' || currentRollStart.type === '9') {
               color = 'rgba(255, 153, 0, 0.5)';
               height = BASE_NOTE_RADIUS * 2.4 * 0.8;
             }
@@ -1722,12 +1698,12 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
               const glowAlpha = 0.25 + pulse * 0.35
 
               ctx.save()
-              ctx.fillStyle = currentRollStart.type === '7'
+              ctx.fillStyle = (currentRollStart.type === '7' || currentRollStart.type === '9')
                 ? `rgba(255,255,255,${(glowAlpha * 0.9).toFixed(3)})`
                 : `rgba(255,245,180,${glowAlpha.toFixed(3)})`
               ctx.fillRect(startX, laneCenterY - height / 2, endX - startX, height)
 
-              ctx.strokeStyle = currentRollStart.type === '7'
+              ctx.strokeStyle = (currentRollStart.type === '7' || currentRollStart.type === '9')
                 ? `rgba(255,180,80,${(0.75 + pulse * 0.2).toFixed(3)})`
                 : `rgba(255,230,120,${(0.7 + pulse * 0.2).toFixed(3)})`
               ctx.lineWidth = 2 + pulse * 1.5
@@ -1806,7 +1782,7 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
         ctx.stroke()
         ctx.restore()
 
-        if (note.type === '7') {
+        if (note.type === '7' || note.type === '9') {
           const hits = note.attributes?.hits || 5
           ctx.fillStyle = '#000'
           ctx.font = 'bold 12px sans-serif'
@@ -1974,16 +1950,16 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
     }
   }, [])
 
-  const jumpToMeasure = useCallback((measure: number) => {
+  const jumpToMeasure = useCallback((measure: number, smoothScroll = false) => {
     const target = isPlaying ? Math.max(-leadInMeasures, measure) : Math.max(0, measure)
     setSeekPos(target)
-    centerScrollOnSeek(target)
+    centerScrollOnSeek(target, smoothScroll)
   }, [isPlaying, leadInMeasures, centerScrollOnSeek])
 
   const handleMeasureJump = useCallback(() => {
     const parsed = Number(measureJumpInput)
     if (!Number.isFinite(parsed)) return
-    jumpToMeasure(Math.trunc(parsed))
+    jumpToMeasure(Math.trunc(parsed), true)
   }, [measureJumpInput, jumpToMeasure])
 
   // Canvas Interactions
@@ -2204,7 +2180,7 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
       return Math.abs(x - nx) < BASE_NOTE_RADIUS && Math.abs(y - laneCenterY) < BASE_NOTE_RADIUS
     })
 
-    if (clickedNote && clickedNote.type === '7') {
+    if (clickedNote && (clickedNote.type === '7' || clickedNote.type === '9')) {
       setAttributeModal({ noteId: clickedNote.id, hits: (clickedNote.attributes?.hits || 5).toString() })
       return
     }
@@ -2242,6 +2218,25 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
   }
 
   const saveCommand = async (type: 'BPM' | 'HS' | 'MEASURE' | 'GOGOSTART' | 'GOGOEND', measure: number, pos: number, value: string | null) => {
+    if (type === 'BPM' || type === 'HS') {
+      const parsed = parseFloat(value ?? '')
+      if (!Number.isNaN(parsed) && parsed < 0) {
+        alert(`${type}にマイナス値は設定できません。`)
+        return
+      }
+    }
+    if (type === 'MEASURE' && value) {
+      const m = value.match(/^\s*(-?\d+(?:\.\d+)?)\s*\/\s*(-?\d+(?:\.\d+)?)\s*$/)
+      if (m) {
+        const n = parseFloat(m[1])
+        const d = parseFloat(m[2])
+        if (n < 0 || d < 0) {
+          alert('MEASUREにマイナス値は設定できません。')
+          return
+        }
+      }
+    }
+
     const existingCmd = commands.find(c => c.measure === measure && c.position === pos && c.type === type)
     const newCmd = {
       id: existingCmd ? existingCmd.id : crypto.randomUUID(),
@@ -2412,7 +2407,7 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
           if (abs > absTarget) break;
           // We don't block placing exactly on the start note itself (that is a collision checked earlier)
           // But if we are *strictly strictly greater* than the start note and *less* than the end note:
-          if (abs < absTarget && ['5', '6', '7'].includes(n.type)) inside = true;
+          if (abs < absTarget && ['5', '6', '7', '9'].includes(n.type)) inside = true;
           if (abs <= absTarget && n.type === '8') inside = false;
         }
         return inside;
@@ -2423,7 +2418,7 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
         if (existingNote) {
           // Find paired note if applicable
           let pairedNote: Note | undefined
-          if (['5', '6', '7'].includes(existingNote.type)) {
+          if (['5', '6', '7', '9'].includes(existingNote.type)) {
             // Find next 8
             const sorted = [...state.notes].sort((a, b) => (a.measure * GRID_DIVISIONS + a.position) - (b.measure * GRID_DIVISIONS + b.position));
             const startAbs = existingNote.measure * GRID_DIVISIONS + existingNote.position;
@@ -2436,7 +2431,7 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
             for (const n of sorted) {
               const abs = n.measure * GRID_DIVISIONS + n.position;
               if (abs >= endAbs) break;
-              if (['5', '6', '7'].includes(n.type)) lastStart = n;
+              if (['5', '6', '7', '9'].includes(n.type)) lastStart = n;
               else if (n.type === '8') lastStart = undefined;
             }
             pairedNote = lastStart;
@@ -2473,11 +2468,11 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
         type: selectedType,
         last_modified_at: Date.now(),
         last_modified_by: userId,
-        attributes: selectedType === '7' ? { hits: 5 } : {}
+        attributes: (selectedType === '7' || selectedType === '9') ? { hits: 5 } : {}
       }
 
       let endNote: Note | null = null
-      const isRollStart = ['5', '6', '7'].includes(selectedType)
+      const isRollStart = ['5', '6', '7', '9'].includes(selectedType)
 
       // Auto-place endpoint (type 8) 4 grids ahead
       if (isRollStart && !existingNote) {
@@ -2555,10 +2550,25 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
     setShowResetModal(false)
     const oldNotes = [...notes]
     const oldCmds = [...commands]
+    const oldMetadata = { ...metadata }
+    const oldTjaText = tjaText
+    const oldAudioUrl = audioUrl
+    const oldWaveformPeaks = [...waveformPeaks]
+    const oldAudioDuration = audioDuration
 
     // Optimistic clear locally
+    audioEngine.stop()
+    setIsPlaying(false)
     setNotes([])
     setCommands([])
+    setMetadata({ ...DEFAULT_CHART_METADATA })
+    setTjaText('')
+    setTjaDirty(false)
+    setAudioUrl(null)
+    setWaveformPeaks([])
+    setAudioDuration(0)
+    audioEngine.audioBuffer = null
+    noteHitAnimRef.current.clear()
     historyRef.current = []
     historyIndexRef.current = -1
     setHistoryLength(0)
@@ -2576,10 +2586,11 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
         throw notesDel.error || cmdsDel.error
       }
 
-      // Also clear the TJA text in the room record to avoid it being re-populated from the source view
-      if (roomSupportsTjaSource) {
-        await supabase.from('rooms').update({ tja_text: '' }).eq('id', roomId)
-      }
+      await supabase.storage.from('audio').remove([`${roomId}.ogg`])
+      await supabase.from('rooms').update({
+        ...DEFAULT_CHART_METADATA,
+        tja_text: ''
+      }).eq('id', roomId)
 
       // Notify other clients to refresh their state
       if (channelRef.current) {
@@ -2592,6 +2603,11 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
     } catch (err) {
       console.error('Failed to reset data in Supabase:', err)
       // Rollback local state on failure
+      setMetadata(oldMetadata)
+      setTjaText(oldTjaText)
+      setAudioUrl(oldAudioUrl)
+      setWaveformPeaks(oldWaveformPeaks)
+      setAudioDuration(oldAudioDuration)
       setNotes(oldNotes)
       setCommands(oldCmds)
       alert('一部またはすべてのデータの削除に失敗しました。接続を確認してください。')
@@ -2839,44 +2855,26 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
 
     // Delete data if option is selected
     if (deleteAfterExport) {
-      try {
-        // Delete audio file from storage
-        if (metadata.audio_url) {
-          const fileName = `${roomId}.ogg`
-          await supabase.storage.from('audio').remove([fileName])
-        }
-
-        // Delete all notes and commands
-        const allNoteIds = stateRef.current.notes.map(n => n.id)
-        const allCmdIds = stateRef.current.commands.map(c => c.id)
-        if (allNoteIds.length > 0) await supabase.from('notes').delete().in('id', allNoteIds)
-        if (allCmdIds.length > 0) await supabase.from('commands').delete().in('id', allCmdIds)
-
-        // Update room to clear audio_url
-        await supabase.from('rooms').update({ audio_url: null }).eq('id', roomId)
-
-        setNotes([])
-        setCommands([])
-        setAudioUrl(null)
-        setShowExportDeleteModal(false)
-        setDeleteAfterExport(false)
-      } catch (err) {
-        console.error('Error deleting data after export:', err)
-      }
+      await handleReset()
+      setShowExportDeleteModal(false)
+      setDeleteAfterExport(false)
     } else {
       setShowExportDeleteModal(false)
     }
-  }, [tjaText, metadata.title, deleteAfterExport, roomId, metadata.audio_url])
+  }, [tjaText, metadata.title, deleteAfterExport, handleReset])
 
   const handleImportTja = async () => {
     try {
       const result = tjaToGui(importTjaFileText)
+      const normalizedMetadata: TjaMetadata = {
+        ...result.metadata,
+        bpm: parseFloat(result.commands.find(c => c.type === 'BPM' && c.measure === 0 && c.position === 0)?.value || String(result.metadata.bpm || 120))
+      }
 
       // Update metadata
-      setMetadata(result.metadata)
-      saveMetadata(result.metadata)
+      setMetadata(normalizedMetadata)
+      saveMetadata(normalizedMetadata)
       tjaSourceRef.current = 'tja'
-      setTjaText(importTjaFileText)
       setTjaDirty(false)
 
       // Clear existing notes and commands
@@ -2907,6 +2905,13 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
         last_modified_by: userId
       }))
 
+      const normalizedTjaText = guiToTja(
+        normalizedMetadata,
+        newCommands.map(c => ({ measure: c.measure, position: c.position, type: c.type, value: c.value })),
+        newNotes.map(n => ({ measure: n.measure, position: n.position, type: n.type, attributes: n.attributes }))
+      )
+      setTjaText(normalizedTjaText)
+
       // Update local state
       setNotes(newNotes)
       setCommands(newCommands)
@@ -2932,7 +2937,7 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
       }
 
       if (roomSupportsTjaSource) {
-        await supabase.from('rooms').update({ tja_text: importTjaFileText }).eq('id', roomId)
+        await supabase.from('rooms').update({ tja_text: normalizedTjaText }).eq('id', roomId)
       }
 
       // Close modal and reset input
@@ -2971,7 +2976,21 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
       return
     }
     try {
-      const text = await file.text()
+      const bytes = new Uint8Array(await file.arrayBuffer())
+      let text = ''
+
+      // 1) UTF-8 (BOM and strict UTF-8)
+      try {
+        if (bytes.length >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) {
+          text = new TextDecoder('utf-8').decode(bytes.subarray(3))
+        } else {
+          text = new TextDecoder('utf-8', { fatal: true }).decode(bytes)
+        }
+      } catch {
+        // 2) Fallback: Shift-JIS
+        text = new TextDecoder('shift_jis').decode(bytes)
+      }
+
       setImportTjaFileText(text)
       setImportTjaFileName(file.name)
     } catch (err) {
@@ -3022,7 +3041,7 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
       {/* Top Bar */}
       <div className="flex items-center justify-between px-6 py-4 bg-neutral-800 border-b border-neutral-700 shadow-xl z-20">
         <div className="flex items-center gap-4">
-          <button onClick={onBack} className="p-2 hover:bg-neutral-700 rounded-xl transition-colors text-neutral-400 hover:text-white">
+          <button onClick={handleBackClick} className="p-2 hover:bg-neutral-700 rounded-xl transition-colors text-neutral-400 hover:text-white">
             <ArrowLeft className="w-6 h-6" />
           </button>
           <div>

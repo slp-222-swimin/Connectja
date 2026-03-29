@@ -68,6 +68,23 @@ function commandToTja(cmd: TjaCommand): string {
   }
 }
 
+function normalizeCommandValue(type: TjaCommand['type'], value: string | null): string | null {
+  if (value == null) return value
+  if (type === 'BPM' || type === 'HS') {
+    const num = parseFloat(value)
+    if (Number.isNaN(num)) return value
+    return String(Math.abs(num))
+  }
+  if (type === 'MEASURE') {
+    const m = value.match(/^\s*(-?\d+(?:\.\d+)?)\s*\/\s*(-?\d+(?:\.\d+)?)\s*$/)
+    if (!m) return value
+    const n = Math.abs(parseFloat(m[1]))
+    const d = Math.abs(parseFloat(m[2]))
+    return `${n}/${d}`
+  }
+  return value
+}
+
 // GUI -> TJA
 export function guiToTja(metadata: TjaMetadata, commands: TjaCommand[], notes: TjaNote[]): string {
   const lines: string[] = []
@@ -98,7 +115,7 @@ export function guiToTja(metadata: TjaMetadata, commands: TjaCommand[], notes: T
   lines.push(`COURSE:${DIFFICULTY_MAP[metadata.difficulty] || '3'}`)
   lines.push(`LEVEL:${metadata.level || 1}`)
 
-  const balloons = notes.filter(n => n.type === '7').sort((a, b) => a.measure - b.measure || a.position - b.position)
+  const balloons = notes.filter(n => n.type === '7' || n.type === '9').sort((a, b) => a.measure - b.measure || a.position - b.position)
   if (balloons.length) lines.push(`BALLOON:${balloons.map(n => n.attributes?.hits ?? 5).join(',')}`)
 
   lines.push('', '#START')
@@ -180,7 +197,13 @@ export function tjaToGui(tjaText: string): TjaParseResult {
         switch (key) {
           case 'TITLE': metadata.title = val; break
           case 'SUBTITLE': metadata.subtitle = val.replace(/^--/, ''); break
-          case 'BPM': metadata.bpm = parseFloat(val) || 120; commands.push({ measure: 0, position: 0, type: 'BPM', value: val }); break
+          case 'BPM': {
+            const bpm = Math.abs(parseFloat(val))
+            const bpmValue = Number.isNaN(bpm) ? '120' : String(bpm)
+            metadata.bpm = Number.isNaN(bpm) ? 120 : bpm
+            commands.push({ measure: 0, position: 0, type: 'BPM', value: bpmValue })
+            break
+          }
           case 'OFFSET': metadata.offset = parseFloat(val) || 0; break
           case 'SEVOL': {
             const parsed = parseFloat(val)
@@ -223,7 +246,7 @@ export function tjaToGui(tjaText: string): TjaParseResult {
             let pos = Math.round((j / len) * GRID_DIVISIONS), m = measure
             while (pos >= GRID_DIVISIONS) { m++; pos -= GRID_DIVISIONS }
             const note: TjaNote = { measure: m, position: pos, type }
-            if (type === '7' && metadata.balloon?.[balloonIdx] != null) note.attributes = { hits: metadata.balloon[balloonIdx++] }
+            if ((type === '7' || type === '9') && metadata.balloon?.[balloonIdx] != null) note.attributes = { hits: metadata.balloon[balloonIdx++] }
             notes.push(note)
           }
         }
@@ -233,7 +256,8 @@ export function tjaToGui(tjaText: string): TjaParseResult {
           const [name, ...valParts] = cmd.line.split(/\s+/)
           const val = valParts.join(' ') || null
           const typeMap: Record<string, TjaCommand['type']> = { '#BPMCHANGE': 'BPM', '#SCROLL': 'HS', '#MEASURE': 'MEASURE', '#GOGOSTART': 'GOGOSTART', '#GOGOEND': 'GOGOEND' }
-          if (typeMap[name.toUpperCase()]) commands.push({ measure: m, position: pos, type: typeMap[name.toUpperCase()], value: val })
+          const mappedType = typeMap[name.toUpperCase()]
+          if (mappedType) commands.push({ measure: m, position: pos, type: mappedType, value: normalizeCommandValue(mappedType, val) })
         }
         measure++
         measureBuffer = ''

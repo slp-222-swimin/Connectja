@@ -282,7 +282,7 @@ class AudioEngine {
               }
               onNoteTriggered?.(note.id, scheduleAtCtxTime)
             }
-          } else if (note.type === '7') {
+          } else if (note.type === '7' || note.type === '9') {
             const requestedHits = Math.max(1, Number(note.attributes?.hits) || 5)
             const endNote = notes.find(n => n.type === '8' && (n.measure > note.measure || (n.measure === note.measure && n.position > note.position)))
             const endTime = endNote ? getAbsoluteTime(endNote.measure, endNote.position) : noteTime
