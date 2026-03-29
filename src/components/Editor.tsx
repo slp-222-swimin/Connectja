@@ -1,6 +1,6 @@
-import { useEffect, useRef, useState, useLayoutEffect, useMemo, useCallback } from 'react'
+﻿import { useEffect, useRef, useState, useLayoutEffect, useMemo, useCallback } from 'react'
 import { supabase } from '../lib/supabase'
-import { ArrowLeft, Save, Users, Settings, Info, Trash2, Undo, Redo, Copy, ClipboardPaste, ZoomIn, ZoomOut, Play, AlertTriangle, FileText, Download } from 'lucide-react'
+import { ArrowLeft, Save, Users, Settings, Info, Trash2, Undo, Redo, Copy, ClipboardPaste, ZoomIn, ZoomOut, Play, AlertTriangle, FileText, Download, History as HistoryIcon } from 'lucide-react'
 import { guiToTja, tjaToGui, type TjaNote, type TjaCommand, type TjaMetadata } from '../lib/tjaConverter'
 import MonacoEditor, { type OnMount } from '@monaco-editor/react'
 import { TJA_LANGUAGE_ID, tjaLanguageConfig, tjaTokensProvider, tjaThemeRules } from '../lib/tjaLanguage'
@@ -36,12 +36,26 @@ interface EditorProps {
   onBack: () => void
 }
 
+type HistoryEntry = {
+  action: string
+  notes?: Note[]
+  oldNotes?: Note[]
+  newCommands?: Command[]
+  oldCommands?: Command[]
+  createdAt: number
+  label: string
+}
+
 const GRID_DIVISIONS = 96
 const LANE_HEIGHT = 200
 const BASE_NOTE_RADIUS = 24
 const HEADER_HEIGHT = 40
 const WAVEFORM_HEIGHT = 100
 const ZOOM_BASE_SCALE = 1.4
+const BASE_LEAD_IN_MEASURES = 1
+const NEGATIVE_LEAD_PADDING_MEASURES = 2 // buffer before chart start, per request
+const AUDIO_START_BASE_SECONDS = 0 // base audio start time; extendable if audio file has extra lead-in
+const PLAYBACK_START_PREROLL_SECONDS = 0.05 // start slightly earlier to avoid edge-note miss at play boundary
 
 const withCacheBuster = (url: string) => {
   try {
@@ -64,15 +78,17 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
   // Layout & View States
   const [baseWidth, setBaseWidth] = useState(1000)
   const [zoom, setZoom] = useState(1.0)
-  const [seekPos, setSeekPos] = useState(0) // In continuous measures (e.g., 1.5 = middle of measure 1)
+  const [seekPos, setSeekPos] = useState(() => -BASE_LEAD_IN_MEASURES) // start the seekbar at Measure -001
   const [snapDivisions, setSnapDivisions] = useState(8) // Default 8th notes
 
   // History & Advanced States (stored in ref for immediate access inside async handlers)
-  const historyRef = useRef<{ action: string, notes?: Note[], oldNotes?: Note[], newCommands?: any[], oldCommands?: any[] }[]>([])
+  const historyRef = useRef<HistoryEntry[]>([])
   const historyIndexRef = useRef(-1)
   // Keep reactive copies so the UI toolbar can read them
   const [historyLength, setHistoryLength] = useState(0)
   const [historyIndexState, setHistoryIndexState] = useState(-1)
+  const [showHistoryModal, setShowHistoryModal] = useState(false)
+  const [isHistoryJumping, setIsHistoryJumping] = useState(false)
   const [selectedNotes, setSelectedNotes] = useState<Set<string>>(new Set())
   const [selectionBox, setSelectionBox] = useState<{ startX: number, startY: number, endX: number, endY: number } | null>(null)
   const [isDragging, setIsDragging] = useState(false)
@@ -113,6 +129,13 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
     audio_url: null
   })
 
+  const initialBpmCmd = commands.find(c => c.type === 'BPM' && c.measure === 0 && c.position === 0)
+  const initialBpmValue = parseFloat(initialBpmCmd?.value || '120')
+  const normalizedBpm = initialBpmValue > 0 ? initialBpmValue : 120
+  const measureDurationSec = (60 / normalizedBpm) * 4
+  const leadSeconds = Math.max(0, AUDIO_START_BASE_SECONDS + (metadata.offset ?? 0))
+  const leadInMeasures = Math.max(BASE_LEAD_IN_MEASURES, Math.ceil(leadSeconds / Math.max(measureDurationSec, 0.001)) + NEGATIVE_LEAD_PADDING_MEASURES)
+
   // Audio & Playback States
   const [audioUrl, setAudioUrl] = useState<string | null>(null)
   const [audioUploading, setAudioUploading] = useState(false)
@@ -133,7 +156,18 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
 
   // Import TJA Modal State
   const [showImportModal, setShowImportModal] = useState(false)
-  const [importTjaText, setImportTjaText] = useState('')
+  const [importTjaFileText, setImportTjaFileText] = useState('')
+  const [importTjaFileName, setImportTjaFileName] = useState('')
+  const [measureJumpInput, setMeasureJumpInput] = useState('0')
+  const initialSeekSyncedRef = useRef(false)
+  const previousLeadInMeasuresRef = useRef(BASE_LEAD_IN_MEASURES)
+  const lastAutoScrollLeftRef = useRef(0)
+  const previousZoomRef = useRef(1.0)
+  const seekMagnetAnimRef = useRef<number | null>(null)
+  const latestSeekPosRef = useRef(0)
+  const lastMagnetDirectionRef = useRef(1)
+  const seekGestureRef = useRef<{ startX: number, moved: boolean, rawSeek: number, snappedSeek: number } | null>(null)
+  const noteHitAnimRef = useRef<Map<string, number>>(new Map()) // noteId -> AudioContext scheduled time
 
   const pushPresenceNotice = useCallback((message: string, color: string) => {
     const id = crypto.randomUUID()
@@ -166,8 +200,6 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
   }, [metadata.songvol, metadata.sevol])
 
   const SNAP_OPTIONS = [4, 8, 12, 16, 24, 32, 48]
-
-  const LEAD_IN_MEASURES = 1
   const BASE_MEASURE_WIDTH = (baseWidth * 0.5) * zoom * ZOOM_BASE_SCALE // 4/4 width
 
   const maxMeasure = Math.max(0, ...notes.map(n => n.measure))
@@ -235,7 +267,7 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
     let currentBPM = 120
     let currentHS = 1.0
 
-    const firstM = -LEAD_IN_MEASURES
+    const firstM = -leadInMeasures
 
     // Find initial BPM
     const initialBPMCmd = [...commands]
@@ -257,8 +289,8 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
       if (!isNaN(val)) currentHS = val
     }
 
-    for (let i = 0; i < TOTAL_MEASURES + LEAD_IN_MEASURES; i++) {
-      const m = i - LEAD_IN_MEASURES
+    for (let i = 0; i < TOTAL_MEASURES + leadInMeasures; i++) {
+      const m = i - leadInMeasures
 
       // Get Measure Command
       const mCmd = [...commands].filter(c => c.type === 'MEASURE' && c.measure <= m).sort((a, b) => a.measure - b.measure).pop()
@@ -333,10 +365,10 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
       currentStartTime += duration
     }
     return infos
-  }, [commands, TOTAL_MEASURES, zoom, baseWidth])
+  }, [commands, TOTAL_MEASURES, zoom, baseWidth, leadInMeasures])
 
   const getMeasureInfo = (m: number) => {
-    const idx = m + LEAD_IN_MEASURES
+    const idx = m + leadInMeasures
     if (!measureInfos[idx]) {
       const dummyPosOffsets = new Array(GRID_DIVISIONS + 1).fill(0).map((_, i) => (i / GRID_DIVISIONS) * BASE_MEASURE_WIDTH)
       const dummyTimeOffsets = new Array(GRID_DIVISIONS + 1).fill(0).map((_, i) => (i / GRID_DIVISIONS) * 2.0)
@@ -377,7 +409,7 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
 
     // TJA OFFSET standard: music_time = chart_time - OFFSET
     return timeRelativeToMeasure0 + localTime - metadata.offset
-  }, [measureInfos, metadata.offset])
+  }, [measureInfos, metadata.offset, leadInMeasures])
 
   const getPosFromTime = useCallback((t: number) => {
     const measure0Info = getMeasureInfo(0)
@@ -414,38 +446,106 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
 
     const t0 = info.timeOffsets[p], t1 = info.timeOffsets[p + 1] || t0
     const fraction = t1 > t0 ? (localTime - t0) / (t1 - t0) : 0
-    return { measure: mIdx - LEAD_IN_MEASURES, pos: p + fraction }
-  }, [measureInfos, metadata.offset])
+    return { measure: mIdx - leadInMeasures, pos: p + fraction }
+  }, [measureInfos, metadata.offset, leadInMeasures])
 
-  const getXFromTime = useCallback((t: number) => {
-    const { measure, pos } = getPosFromTime(t)
-    return getX(measure, pos)
-  }, [getPosFromTime, getX])
+  const centerScrollOnX = useCallback((targetX: number) => {
+    const container = containerRef.current
+    if (!container) return
+    const halfWidth = container.clientWidth / 2
+    const maxScroll = Math.max(0, container.scrollWidth - container.clientWidth)
+    const desiredScrollLeft = Math.round(Math.min(maxScroll, Math.max(0, targetX - halfWidth)))
+
+    // Prevent tiny oscillations from sub-pixel seek updates that cause visual blur/afterimage.
+    if (Math.abs(desiredScrollLeft - lastAutoScrollLeftRef.current) < 2) return
+    lastAutoScrollLeftRef.current = desiredScrollLeft
+    container.scrollLeft = desiredScrollLeft
+  }, [])
+
+  const centerScrollOnSeek = useCallback((seek: number) => {
+    const measure = Math.floor(seek)
+    const position = (seek - measure) * GRID_DIVISIONS
+    const targetX = getX(measure, position)
+    centerScrollOnX(targetX)
+  }, [getX, centerScrollOnX])
+
+  const jumpToChartStart = useCallback(() => {
+    if (audioEngine.isPlaying) {
+      audioEngine.stop()
+      setIsPlaying(false)
+    }
+    const startPos = 0
+    setSeekPos(startPos)
+    centerScrollOnSeek(startPos)
+  }, [centerScrollOnSeek])
 
   const stateRef = useRef({ notes, selectedNotes, clipboard, hoverGridObj, snapDivisions, commands, draggingEndpointId, isDraggingNotes, dragStartGrid, originalDraggingNotes, metadata, getAbsoluteTime })
   useEffect(() => {
     stateRef.current = { notes, selectedNotes, clipboard, hoverGridObj, snapDivisions, commands, draggingEndpointId, isDraggingNotes, dragStartGrid, originalDraggingNotes, metadata, getAbsoluteTime }
   })
 
+  useEffect(() => {
+    const previousLead = previousLeadInMeasuresRef.current
+    const previousStart = -previousLead
+    const nextStart = -leadInMeasures
+
+    if (!initialSeekSyncedRef.current) {
+      setSeekPos(nextStart)
+      centerScrollOnSeek(nextStart)
+      initialSeekSyncedRef.current = true
+    } else {
+      setSeekPos(prev => {
+        if (Math.abs(prev - previousStart) < 0.01 || prev < nextStart) {
+          return nextStart
+        }
+        return prev
+      })
+    }
+
+    previousLeadInMeasuresRef.current = leadInMeasures
+  }, [leadInMeasures, centerScrollOnSeek])
+
+  const getHistoryLabel = useCallback((entry: { action: string, notes?: Note[], oldNotes?: Note[], newCommands?: Command[], oldCommands?: Command[] }) => {
+    const countNotes = entry.notes?.length ?? 0
+    const countOldNotes = entry.oldNotes?.length ?? 0
+    const countNewCmds = entry.newCommands?.length ?? 0
+    const countOldCmds = entry.oldCommands?.length ?? 0
+
+    switch (entry.action) {
+      case 'INSERT': return `Note Insert (${countNotes})`
+      case 'DELETE': return `Note Delete (${countNotes})`
+      case 'UPDATE': return `Note Move/Update (${Math.max(countNotes, countOldNotes)})`
+      case 'CMD_INSERT': return `Command Insert (${countNewCmds})`
+      case 'CMD_DELETE': return `Command Delete (${countOldCmds})`
+      case 'CMD_UPDATE': return `Command Update (${Math.max(countNewCmds, countOldCmds)})`
+      default: return entry.action
+    }
+  }, [])
+
   const MAX_HISTORY = 30
-  const pushHistory = useCallback((entry: { action: string, notes?: Note[], oldNotes?: Note[], newCommands?: any[], oldCommands?: any[] }) => {
+  const pushHistory = useCallback((entry: { action: string, notes?: Note[], oldNotes?: Note[], newCommands?: Command[], oldCommands?: Command[] }) => {
+    const normalizedEntry: HistoryEntry = {
+      ...entry,
+      createdAt: Date.now(),
+      label: getHistoryLabel(entry)
+    }
     // Truncate redo tree
     const sliced = historyRef.current.slice(0, historyIndexRef.current + 1)
-    sliced.push(entry)
+    sliced.push(normalizedEntry)
     // Cap at MAX_HISTORY
     if (sliced.length > MAX_HISTORY) sliced.splice(0, sliced.length - MAX_HISTORY)
     historyRef.current = sliced
     historyIndexRef.current = sliced.length - 1
     setHistoryLength(sliced.length)
     setHistoryIndexState(historyIndexRef.current)
-  }, [])
+  }, [getHistoryLabel])
 
 
   const getGridFromX = (x: number) => {
     let mIdx = measureOffsets.findLastIndex(offset => x >= offset - 0.001) // Small epsilon to handle float boundaries
     if (mIdx === -1) mIdx = 0
 
-    const measure = mIdx - LEAD_IN_MEASURES
+    const measure = mIdx - leadInMeasures
     const info = measureInfos[mIdx] || getMeasureInfo(measure)
     const localX = Math.max(0, x - info.offsetX)
 
@@ -472,7 +572,7 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
       snappedMeasure += 1
     }
 
-    return { measure: snappedMeasure, pos: snappedPos, posFloat }
+    return { measure: snappedMeasure, pos: snappedPos, posFloat, rawMeasure: measure, rawPos: posFloat }
   }
 
   const broadcastCommandUpsert = useCallback((upsertedCmds: Command[]) => {
@@ -943,10 +1043,11 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
 
       // Calculate starting time
       let startSec = getAbsoluteTime(Math.floor(seekPos), (seekPos % 1) * GRID_DIVISIONS)
+      startSec -= PLAYBACK_START_PREROLL_SECONDS
 
       // Automatic 2-beat lead-in when playing from start (Measure 0)
       if (Math.abs(seekPos) < 0.01) {
-        const bpm = measureInfos[LEAD_IN_MEASURES]?.bpm || 120
+        const bpm = measureInfos[leadInMeasures]?.bpm || 120
         const leadInSeconds = (60 / bpm) * 2
         startSec -= leadInSeconds
       }
@@ -956,7 +1057,10 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
       })
       audioEngine.startScheduler(
         () => stateRef.current.notes,
-        (m, p) => stateRef.current.getAbsoluteTime(m, p)
+        (m, p) => stateRef.current.getAbsoluteTime(m, p),
+        (noteId, scheduledAtCtxTime) => {
+          noteHitAnimRef.current.set(noteId, scheduledAtCtxTime)
+        }
       )
       setIsPlaying(true)
     }
@@ -968,59 +1072,129 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
     const loop = () => {
       if (audioEngine.isPlaying) {
         const audioTime = audioEngine.getCurrentTime()
-        // chartTime = audioTime + OFFSET
-        const chartTime = audioTime + (stateRef.current.metadata?.offset || 0)
-
-        // Find the start time of Measure 0 to use as a baseline
-        const measure0StartTime = measureInfos[LEAD_IN_MEASURES]?.startTime || 0
-        const globalTime = chartTime + measure0StartTime
-
-        // Find which measure we are in using pre-calculated measureInfos
-        let newSeekPos = 0;
-        const mIdx = measureInfos.findIndex(info => globalTime >= info.startTime && globalTime < info.startTime + info.duration)
-        if (mIdx !== -1) {
-          const mInfo = measureInfos[mIdx]
-          const localTime = globalTime - mInfo.startTime
-
-          let p = 0
-          if (localTime <= 0) p = 0
-          else if (localTime >= mInfo.duration) p = GRID_DIVISIONS
-          else {
-            let est = Math.floor((localTime / mInfo.duration) * GRID_DIVISIONS)
-            p = est
-            if (mInfo.timeOffsets[p] < localTime) {
-              while (p < GRID_DIVISIONS && mInfo.timeOffsets[p + 1] < localTime) p++
-            } else {
-              while (p > 0 && mInfo.timeOffsets[p] > localTime) p--
-            }
-          }
-          const t0 = mInfo.timeOffsets[p], t1 = mInfo.timeOffsets[p + 1] || t0
-          const fraction = t1 > t0 ? (localTime - t0) / (t1 - t0) : 0
-
-          newSeekPos = (mIdx - LEAD_IN_MEASURES) + (p + fraction) / GRID_DIVISIONS
-        } else if (globalTime < measureInfos[0].startTime) {
-          const mInfo = measureInfos[0]
-          const fraction = (globalTime - mInfo.startTime) / mInfo.duration
-          newSeekPos = (-LEAD_IN_MEASURES) + fraction
-        }
+        const { measure, pos } = getPosFromTime(audioTime)
+        const newSeekPos = measure + pos / GRID_DIVISIONS
         setSeekPos(newSeekPos)
 
-        // Auto Scroll to Seek Position
-        if (containerRef.current) {
-          const m = Math.floor(newSeekPos)
-          const p = (newSeekPos - m) * GRID_DIVISIONS
-          const x = getX(m, p)
-
-          const container = containerRef.current
-          const halfWidth = container.clientWidth / 2
-          container.scrollLeft = x - halfWidth
-        }
+        // Auto Scroll to Seek Position using the same position source as seekbar rendering.
+        centerScrollOnX(getX(measure, pos))
       }
       handle = requestAnimationFrame(loop)
     }
     handle = requestAnimationFrame(loop)
     return () => cancelAnimationFrame(handle)
-  }, [measureInfos, LEAD_IN_MEASURES, getX])
+  }, [centerScrollOnX, getPosFromTime, getX])
+
+  useLayoutEffect(() => {
+    if (Math.abs(previousZoomRef.current - zoom) < 1e-6) return
+    previousZoomRef.current = zoom
+    requestAnimationFrame(() => {
+      centerScrollOnSeek(seekPos)
+    })
+  }, [zoom, seekPos, centerScrollOnSeek])
+
+  const performUndo = useCallback(async () => {
+    if (historyIndexRef.current < 0) return
+    const current = historyRef.current[historyIndexRef.current]
+    if (current.action === 'INSERT' && current.notes) {
+      const idsToRemove = new Set(current.notes.map((n: Note) => n.id))
+      const idsArray = current.notes.map((n: Note) => n.id)
+      setNotes(prev => prev.filter(n => !idsToRemove.has(n.id)))
+      broadcastNoteDelete(idsArray)
+      await supabase.from('notes').delete().in('id', idsArray)
+    } else if (current.action === 'DELETE' && current.notes) {
+      const toRestore = current.notes.map((n: Note) => ({ ...n, last_modified_at: Date.now(), last_modified_by: userId }))
+      setNotes(prev => {
+        const existing = new Set(prev.map(n => n.id))
+        return [...prev, ...toRestore.filter((n: Note) => !existing.has(n.id))]
+      })
+      broadcastNoteUpsert(toRestore)
+      await supabase.from('notes').upsert(toRestore, { onConflict: 'room_id,measure,position' })
+    } else if (current.action === 'UPDATE' && current.oldNotes) {
+      const toRestore = current.oldNotes.map((n: Note) => ({ ...n, last_modified_at: Date.now(), last_modified_by: userId }))
+      setNotes(prev => prev.map(n => toRestore.find((o: Note) => o.id === n.id) || n))
+      broadcastNoteUpsert(toRestore)
+      await supabase.from('notes').upsert(toRestore, { onConflict: 'room_id,measure,position' })
+    } else if (current.action === 'CMD_INSERT' && current.newCommands) {
+      const idsToRemove = current.newCommands.map(c => c.id)
+      setCommands(prev => prev.filter(c => !idsToRemove.includes(c.id)))
+      broadcastCommandDelete(idsToRemove)
+      await supabase.from('commands').delete().in('id', idsToRemove)
+    } else if (current.action === 'CMD_DELETE' && current.oldCommands) {
+      const toRestore = current.oldCommands.map(c => ({ ...c, last_modified_at: Date.now(), last_modified_by: userId }))
+      setCommands(prev => [...prev.filter(c => !toRestore.some(r => r.id === c.id)), ...toRestore])
+      broadcastCommandUpsert(toRestore)
+      await supabase.from('commands').upsert(toRestore, { onConflict: 'room_id,measure,position,type' })
+    } else if (current.action === 'CMD_UPDATE' && current.oldCommands) {
+      const toRestore = current.oldCommands.map(c => ({ ...c, last_modified_at: Date.now(), last_modified_by: userId }))
+      setCommands(prev => prev.map(c => toRestore.find(o => o.id === c.id) || c))
+      broadcastCommandUpsert(toRestore)
+      await supabase.from('commands').upsert(toRestore, { onConflict: 'room_id,measure,position,type' })
+    }
+    historyIndexRef.current -= 1
+    setHistoryIndexState(historyIndexRef.current)
+  }, [broadcastCommandDelete, broadcastCommandUpsert, broadcastNoteDelete, broadcastNoteUpsert, userId])
+
+  const performRedo = useCallback(async () => {
+    if (historyIndexRef.current >= historyRef.current.length - 1) return
+    const next = historyRef.current[historyIndexRef.current + 1]
+    if (next.action === 'INSERT' && next.notes) {
+      const toAdd = next.notes.map((n: Note) => ({ ...n, last_modified_at: Date.now(), last_modified_by: userId }))
+      setNotes(prev => {
+        const existing = new Set(prev.map(n => n.id))
+        return [...prev, ...toAdd.filter((n: Note) => !existing.has(n.id))]
+      })
+      broadcastNoteUpsert(toAdd)
+      await supabase.from('notes').upsert(toAdd, { onConflict: 'room_id,measure,position' })
+    } else if (next.action === 'DELETE' && next.notes) {
+      const idsToRemove = new Set(next.notes.map((n: Note) => n.id))
+      const idsArray = next.notes.map((n: Note) => n.id)
+      setNotes(prev => prev.filter(n => !idsToRemove.has(n.id)))
+      broadcastNoteDelete(idsArray)
+      await supabase.from('notes').delete().in('id', idsArray)
+    } else if (next.action === 'UPDATE' && next.notes) {
+      const toApply = next.notes.map((n: Note) => ({ ...n, last_modified_at: Date.now(), last_modified_by: userId }))
+      setNotes(prev => prev.map(n => toApply.find((o: Note) => o.id === n.id) || n))
+      broadcastNoteUpsert(toApply)
+      await supabase.from('notes').upsert(toApply, { onConflict: 'room_id,measure,position' })
+    } else if (next.action === 'CMD_INSERT' && next.newCommands) {
+      const toAdd = next.newCommands.map(c => ({ ...c, last_modified_at: Date.now(), last_modified_by: userId }))
+      setCommands(prev => [...prev.filter(c => !toAdd.some(r => r.id === c.id)), ...toAdd])
+      broadcastCommandUpsert(toAdd)
+      await supabase.from('commands').upsert(toAdd, { onConflict: 'room_id,measure,position,type' })
+    } else if (next.action === 'CMD_DELETE' && next.oldCommands) {
+      const idsToRemove = next.oldCommands.map(c => c.id)
+      setCommands(prev => prev.filter(c => !idsToRemove.includes(c.id)))
+      broadcastCommandDelete(idsToRemove)
+      await supabase.from('commands').delete().in('id', idsToRemove)
+    } else if (next.action === 'CMD_UPDATE' && next.newCommands) {
+      const toApply = next.newCommands.map(c => ({ ...c, last_modified_at: Date.now(), last_modified_by: userId }))
+      setCommands(prev => prev.map(c => toApply.find(o => o.id === c.id) || c))
+      broadcastCommandUpsert(toApply)
+      await supabase.from('commands').upsert(toApply, { onConflict: 'room_id,measure,position,type' })
+    }
+    historyIndexRef.current += 1
+    setHistoryIndexState(historyIndexRef.current)
+  }, [broadcastCommandDelete, broadcastCommandUpsert, broadcastNoteDelete, broadcastNoteUpsert, userId])
+
+  const jumpHistoryToIndex = useCallback(async (targetIndex: number) => {
+    const clamped = Math.max(-1, Math.min(historyRef.current.length - 1, targetIndex))
+    if (clamped === historyIndexRef.current) return
+    setIsHistoryJumping(true)
+    try {
+      let guard = 0
+      while (historyIndexRef.current < clamped && guard < 200) {
+        await performRedo()
+        guard += 1
+      }
+      while (historyIndexRef.current > clamped && guard < 400) {
+        await performUndo()
+        guard += 1
+      }
+    } finally {
+      setIsHistoryJumping(false)
+    }
+  }, [performRedo, performUndo])
 
 
   // Keyboard Shortcuts
@@ -1033,102 +1207,23 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
       const state = stateRef.current
       const key = e.key.toLowerCase()
 
-      // Undo & Redo wrappers
-      const handleUndo = async () => {
-        if (historyIndexRef.current < 0) return
-        const current = historyRef.current[historyIndexRef.current]
-        if (current.action === 'INSERT' && current.notes) {
-          const idsToRemove = new Set(current.notes.map((n: Note) => n.id))
-          const idsArray = current.notes.map((n: Note) => n.id)
-          setNotes(prev => prev.filter(n => !idsToRemove.has(n.id)))
-          broadcastNoteDelete(idsArray)
-          await supabase.from('notes').delete().in('id', idsArray)
-        } else if (current.action === 'DELETE' && current.notes) {
-          const toRestore = current.notes.map((n: Note) => ({ ...n, last_modified_at: Date.now(), last_modified_by: userId }))
-          setNotes(prev => {
-            const existing = new Set(prev.map(n => n.id))
-            return [...prev, ...toRestore.filter((n: Note) => !existing.has(n.id))]
-          })
-          broadcastNoteUpsert(toRestore)
-          await supabase.from('notes').upsert(toRestore, { onConflict: 'room_id,measure,position' })
-        } else if (current.action === 'UPDATE' && current.oldNotes) {
-          const toRestore = current.oldNotes.map((n: Note) => ({ ...n, last_modified_at: Date.now(), last_modified_by: userId }))
-          setNotes(prev => prev.map(n => toRestore.find((o: Note) => o.id === n.id) || n))
-          broadcastNoteUpsert(toRestore)
-          await supabase.from('notes').upsert(toRestore, { onConflict: 'room_id,measure,position' })
-        } else if (current.action === 'CMD_INSERT' && current.newCommands) {
-          const idsToRemove = current.newCommands.map(c => c.id)
-          setCommands(prev => prev.filter(c => !idsToRemove.includes(c.id)))
-          broadcastCommandDelete(idsToRemove)
-          await supabase.from('commands').delete().in('id', idsToRemove)
-        } else if (current.action === 'CMD_DELETE' && current.oldCommands) {
-          const toRestore = current.oldCommands.map(c => ({ ...c, last_modified_at: Date.now(), last_modified_by: userId }))
-          setCommands(prev => [...prev.filter(c => !toRestore.some(r => r.id === c.id)), ...toRestore])
-          broadcastCommandUpsert(toRestore)
-          await supabase.from('commands').upsert(toRestore, { onConflict: 'room_id,measure,position,type' })
-        } else if (current.action === 'CMD_UPDATE' && current.oldCommands) {
-          const toRestore = current.oldCommands.map(c => ({ ...c, last_modified_at: Date.now(), last_modified_by: userId }))
-          setCommands(prev => prev.map(c => toRestore.find(o => o.id === c.id) || c))
-          broadcastCommandUpsert(toRestore)
-          await supabase.from('commands').upsert(toRestore, { onConflict: 'room_id,measure,position,type' })
-        }
-        historyIndexRef.current -= 1
-        setHistoryIndexState(historyIndexRef.current)
-      }
-
-      const handleRedo = async () => {
-        if (historyIndexRef.current >= historyRef.current.length - 1) return
-        const next = historyRef.current[historyIndexRef.current + 1]
-        if (next.action === 'INSERT' && next.notes) {
-          const toAdd = next.notes.map((n: Note) => ({ ...n, last_modified_at: Date.now(), last_modified_by: userId }))
-          setNotes(prev => {
-            const existing = new Set(prev.map(n => n.id))
-            return [...prev, ...toAdd.filter((n: Note) => !existing.has(n.id))]
-          })
-          broadcastNoteUpsert(toAdd)
-          await supabase.from('notes').upsert(toAdd, { onConflict: 'room_id,measure,position' })
-        } else if (next.action === 'DELETE' && next.notes) {
-          const idsToRemove = new Set(next.notes.map((n: Note) => n.id))
-          const idsArray = next.notes.map((n: Note) => n.id)
-          setNotes(prev => prev.filter(n => !idsToRemove.has(n.id)))
-          broadcastNoteDelete(idsArray)
-          await supabase.from('notes').delete().in('id', idsArray)
-        } else if (next.action === 'UPDATE' && next.notes) {
-          const toApply = next.notes.map((n: Note) => ({ ...n, last_modified_at: Date.now(), last_modified_by: userId }))
-          setNotes(prev => prev.map(n => toApply.find((o: Note) => o.id === n.id) || n))
-          broadcastNoteUpsert(toApply)
-          await supabase.from('notes').upsert(toApply, { onConflict: 'room_id,measure,position' })
-        } else if (next.action === 'CMD_INSERT' && next.newCommands) {
-          const toAdd = next.newCommands.map(c => ({ ...c, last_modified_at: Date.now(), last_modified_by: userId }))
-          setCommands(prev => [...prev.filter(c => !toAdd.some(r => r.id === c.id)), ...toAdd])
-          broadcastCommandUpsert(toAdd)
-          await supabase.from('commands').upsert(toAdd, { onConflict: 'room_id,measure,position,type' })
-        } else if (next.action === 'CMD_DELETE' && next.oldCommands) {
-          const idsToRemove = next.oldCommands.map(c => c.id)
-          setCommands(prev => prev.filter(c => !idsToRemove.includes(c.id)))
-          broadcastCommandDelete(idsToRemove)
-          await supabase.from('commands').delete().in('id', idsToRemove)
-        } else if (next.action === 'CMD_UPDATE' && next.newCommands) {
-          const toApply = next.newCommands.map(c => ({ ...c, last_modified_at: Date.now(), last_modified_by: userId }))
-          setCommands(prev => prev.map(c => toApply.find(o => o.id === c.id) || c))
-          broadcastCommandUpsert(toApply)
-          await supabase.from('commands').upsert(toApply, { onConflict: 'room_id,measure,position,type' })
-        }
-        historyIndexRef.current += 1
-        setHistoryIndexState(historyIndexRef.current)
+      if ((e.ctrlKey || e.metaKey) && key === 'arrowleft') {
+        e.preventDefault()
+        jumpToChartStart()
+        return
       }
 
       // Undo
       if (e.ctrlKey && key === 'z' && !e.shiftKey) {
         e.preventDefault()
-        await handleUndo()
+        await performUndo()
         return
       }
 
       // Redo
       if (e.ctrlKey && (key === 'y' || (e.shiftKey && key === 'z'))) {
         e.preventDefault()
-        await handleRedo()
+        await performRedo()
         return
       }
 
@@ -1306,7 +1401,7 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
 
     window.addEventListener('keydown', handleKeyDown)
     return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [togglePlayback, userId])
+  }, [togglePlayback, jumpToChartStart, performUndo, performRedo, userId])
 
   // Canvas Rendering
   useEffect(() => {
@@ -1327,15 +1422,35 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
         const rect = container.getBoundingClientRect()
         const edgeThreshold = 80
         const maxScrollSpeed = 30
+        let didAutoScroll = false
 
         if (currentMouseX < rect.left + edgeThreshold) {
           const distanceFromLeft = rect.left + edgeThreshold - currentMouseX
           const speed = Math.min(maxScrollSpeed, (distanceFromLeft / edgeThreshold) * maxScrollSpeed)
           container.scrollLeft -= speed
+          didAutoScroll = true
         } else if (currentMouseX > rect.right - edgeThreshold) {
           const distanceFromRight = currentMouseX - (rect.right - edgeThreshold)
           const speed = Math.min(maxScrollSpeed, (distanceFromRight / edgeThreshold) * maxScrollSpeed)
           container.scrollLeft += speed
+          didAutoScroll = true
+        }
+
+        // When seeking at screen edges, mousemove may pause while scroll continues.
+        // Keep seek position synced with the auto-scrolled timeline every frame.
+        if (isSeeking && didAutoScroll) {
+          const timelineX = currentMouseX - rect.left + container.scrollLeft
+          const grid = getGridFromX(timelineX)
+          const rawSeek = grid.rawMeasure + grid.rawPos / GRID_DIVISIONS
+          const snappedSeek = grid.measure + grid.pos / GRID_DIVISIONS
+          if (seekGestureRef.current) {
+            seekGestureRef.current.moved = true
+            seekGestureRef.current.rawSeek = rawSeek
+            seekGestureRef.current.snappedSeek = snappedSeek
+          } else {
+            seekGestureRef.current = { startX: timelineX, moved: true, rawSeek, snappedSeek }
+          }
+          setSeekPos(rawSeek)
         }
       }
 
@@ -1384,6 +1499,8 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
         const measure0Info = getMeasureInfo(0)
 
         ctx.fillStyle = 'rgba(255, 255, 255, 0.35)'
+        // Avoid alpha stacking by merging bars that land on the same pixel column.
+        const waveformColumnMax = new Map<number, number>()
 
         const startMIdx = measureOffsets.findIndex(o => o >= visibleStartX)
         const endMIdx = measureOffsets.findIndex(o => o >= visibleEndX)
@@ -1441,10 +1558,16 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
 
             if (x >= visibleStartX && x <= visibleEndX) {
               const h = Math.max(2, val * WAVEFORM_HEIGHT)
-              ctx.fillRect(x, waveformY + (WAVEFORM_HEIGHT - h) / 2, 2, h)
+              const col = Math.round(x)
+              const prev = waveformColumnMax.get(col) ?? 0
+              if (h > prev) waveformColumnMax.set(col, h)
             }
           }
         }
+
+        waveformColumnMax.forEach((h, col) => {
+          ctx.fillRect(col - 1, waveformY + (WAVEFORM_HEIGHT - h) / 2, 2, h)
+        })
       }
 
       // Draw GOGO background (orange overlay for gogo sections)
@@ -1481,7 +1604,7 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
         const offsetX = measureOffsets[i]
         if (offsetX > visibleEndX) break
 
-        const m = i - LEAD_IN_MEASURES
+        const m = i - leadInMeasures
         const info = getMeasureInfo(m)
         const measureW = info.totalWidth
 
@@ -1502,14 +1625,15 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
 
         // Grid Lines within measure
         const beats = info.n
-        const subInterval = GRID_DIVISIONS / snapDivisions
-        for (let p = 0; p < GRID_DIVISIONS; p += subInterval) {
-          if (p === 0) continue
-          const gx = offsetX + info.posOffsets[p]
+        for (let step = 1; step < snapDivisions; step++) {
+          const p = Math.round((step * GRID_DIVISIONS) / snapDivisions)
+          if (p <= 0 || p >= GRID_DIVISIONS) continue
+          const gx = offsetX + (info.posOffsets[p] ?? 0)
 
           if (gx < visibleStartX || gx > visibleEndX) continue
 
-          const isBeat = (p % (GRID_DIVISIONS / beats)) === 0
+          const beatInterval = GRID_DIVISIONS / Math.max(1, beats)
+          const isBeat = Math.abs((p / beatInterval) - Math.round(p / beatInterval)) < 1e-6
           ctx.strokeStyle = isBeat ? '#333' : '#222'
           ctx.lineWidth = isBeat ? 2 : 1
           ctx.beginPath()
@@ -1565,6 +1689,7 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
       // Roll/Balloon Connections
       const sortedNotes = [...notes].sort((a, b) => (a.measure * GRID_DIVISIONS + a.position) - (b.measure * GRID_DIVISIONS + b.position));
       let currentRollStart: Note | null = null;
+      const currentSeekAbs = seekPos * GRID_DIVISIONS
       for (const n of sortedNotes) {
         if (['5', '6', '7'].includes(n.type)) {
           currentRollStart = n;
@@ -1585,12 +1710,41 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
 
             ctx.fillStyle = color;
             ctx.fillRect(startX, laneCenterY - height / 2, endX - startX, height);
+
+            // Active roll/balloon animation while repeatedly hittable during playback.
+            const startAbs = currentRollStart.measure * GRID_DIVISIONS + currentRollStart.position
+            const endAbs = n.measure * GRID_DIVISIONS + n.position
+            const isActiveRoll = isPlaying && currentSeekAbs >= startAbs && currentSeekAbs <= endAbs
+            if (isActiveRoll) {
+              const rollProgress = Math.max(0, Math.min(1, (currentSeekAbs - startAbs) / Math.max(1, endAbs - startAbs)))
+              const sweepX = startX + (endX - startX) * rollProgress
+              const pulse = 0.5 + 0.5 * Math.sin(performance.now() * 0.03)
+              const glowAlpha = 0.25 + pulse * 0.35
+
+              ctx.save()
+              ctx.fillStyle = currentRollStart.type === '7'
+                ? `rgba(255,255,255,${(glowAlpha * 0.9).toFixed(3)})`
+                : `rgba(255,245,180,${glowAlpha.toFixed(3)})`
+              ctx.fillRect(startX, laneCenterY - height / 2, endX - startX, height)
+
+              ctx.strokeStyle = currentRollStart.type === '7'
+                ? `rgba(255,180,80,${(0.75 + pulse * 0.2).toFixed(3)})`
+                : `rgba(255,230,120,${(0.7 + pulse * 0.2).toFixed(3)})`
+              ctx.lineWidth = 2 + pulse * 1.5
+              ctx.beginPath()
+              ctx.moveTo(sweepX, laneCenterY - height / 2 - 2)
+              ctx.lineTo(sweepX, laneCenterY + height / 2 + 2)
+              ctx.stroke()
+              ctx.restore()
+            }
           }
           currentRollStart = null;
         }
       }
 
       // Draw Notes
+      const ctxNow = audioEngine.ctx?.currentTime
+      const HIT_ANIM_DURATION_MS = 220
       const notesByZ = [...notes].sort(
         (a, b) => (b.measure * GRID_DIVISIONS + b.position) - (a.measure * GRID_DIVISIONS + a.position)
       )
@@ -1600,14 +1754,47 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
 
         const y = laneCenterY
         const typeConfig = NOTE_TYPES.find(t => t.id === note.type) || { color: '#fff', size: 1 }
+        const hitStartedAt = noteHitAnimRef.current.get(note.id)
+        const hitElapsed = (hitStartedAt !== undefined && ctxNow !== undefined)
+          ? ((ctxNow - hitStartedAt) * 1000)
+          : Number.POSITIVE_INFINITY
+        const hitActive = hitElapsed >= 0 && hitElapsed <= HIT_ANIM_DURATION_MS
+        const hitProgress = hitActive ? (hitElapsed / HIT_ANIM_DURATION_MS) : 1
+        const baseRadius = BASE_NOTE_RADIUS * typeConfig.size
 
         ctx.beginPath()
         ctx.fillStyle = typeConfig.color
-        ctx.arc(x, y, BASE_NOTE_RADIUS * typeConfig.size, 0, Math.PI * 2)
+        ctx.arc(x, y, baseRadius, 0, Math.PI * 2)
         ctx.fill()
 
+        if (hitActive) {
+          const fadeAlpha = Math.max(0, Math.pow(1 - hitProgress, 2.4))
+          const expandRadius = baseRadius * (1 + hitProgress) // final radius = 2x base
+          const ringRadius = baseRadius + (baseRadius * hitProgress)
+          ctx.save()
+          // Use explicit RGBA so fade is visually obvious regardless of base note color.
+          const fillAlpha = Math.min(0.45, fadeAlpha * 0.55)
+          const strokeAlpha = Math.min(0.9, fadeAlpha)
+          ctx.fillStyle = `rgba(255,255,255,${fillAlpha.toFixed(3)})`
+          ctx.beginPath()
+          ctx.arc(x, y, expandRadius, 0, Math.PI * 2)
+          ctx.fill()
+
+          ctx.strokeStyle = `rgba(255,255,255,${strokeAlpha.toFixed(3)})`
+          ctx.lineWidth = 3
+          ctx.beginPath()
+          ctx.arc(x, y, ringRadius, 0, Math.PI * 2)
+          ctx.stroke()
+          ctx.restore()
+        } else if (hitStartedAt !== undefined && hitElapsed > HIT_ANIM_DURATION_MS) {
+          noteHitAnimRef.current.delete(note.id)
+        }
+
         ctx.save()
-        if (selectedNotes.has(note.id)) {
+        if (hitActive) {
+          ctx.strokeStyle = '#fff'
+          ctx.lineWidth = 3
+        } else if (selectedNotes.has(note.id)) {
           ctx.shadowColor = '#fff'
           ctx.shadowBlur = 15
           ctx.strokeStyle = '#fff'
@@ -1673,26 +1860,28 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
         ctx.fillText(nameLabel, pX, HEADER_HEIGHT - 10)
       })
 
-      // Draw Seekbar (Self)
-      const seekM = Math.floor(seekPos)
-      const seekP = (seekPos - seekM) * GRID_DIVISIONS
-      const seekX = getX(seekM, seekP)
+      // Draw Seekbar (Self) when not playing.
+      if (!isPlaying) {
+        const seekMeasure = Math.floor(seekPos)
+        const seekGridPos = (seekPos - seekMeasure) * GRID_DIVISIONS
+        const seekX = Math.round(getX(seekMeasure, seekGridPos)) + 0.5
 
-      if (seekX >= visibleStartX && seekX <= visibleEndX) {
-        ctx.strokeStyle = '#ff3333'
-        ctx.lineWidth = 2
-        ctx.beginPath()
-        ctx.moveTo(seekX, 0)
-        ctx.lineTo(seekX, canvas.height)
-        ctx.stroke()
+        if (seekX >= visibleStartX && seekX <= visibleEndX) {
+          ctx.strokeStyle = '#ff3333'
+          ctx.lineWidth = 2
+          ctx.beginPath()
+          ctx.moveTo(seekX, 0)
+          ctx.lineTo(seekX, canvas.height)
+          ctx.stroke()
 
-        ctx.fillStyle = '#ff3333'
-        ctx.beginPath()
-        ctx.moveTo(seekX - 6, 0)
-        ctx.lineTo(seekX + 6, 0)
-        ctx.lineTo(seekX, 10)
-        ctx.closePath()
-        ctx.fill()
+          ctx.fillStyle = '#ff3333'
+          ctx.beginPath()
+          ctx.moveTo(seekX - 6, 0)
+          ctx.lineTo(seekX + 6, 0)
+          ctx.lineTo(seekX, 10)
+          ctx.closePath()
+          ctx.fill()
+        }
       }
 
       if (selectionBox) {
@@ -1712,7 +1901,90 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
     }
     render()
     return () => cancelAnimationFrame(animationFrameId)
-  }, [notes, selectedNotes, selectionBox, zoom, seekPos, TOTAL_MEASURES, baseWidth, snapDivisions, commands, presenceState, userId, measureInfos, measureOffsets, waveformPeaks, metadata, isDragging, isDraggingNotes, draggingEndpointId, isSeeking, currentMouseX])
+  }, [notes, selectedNotes, selectionBox, zoom, seekPos, TOTAL_MEASURES, baseWidth, snapDivisions, commands, presenceState, userId, measureInfos, measureOffsets, waveformPeaks, metadata, isPlaying, isDragging, isDraggingNotes, draggingEndpointId, isSeeking, currentMouseX])
+
+  useEffect(() => {
+    latestSeekPosRef.current = seekPos
+  }, [seekPos])
+
+  useEffect(() => {
+    const existing = new Set(notes.map(n => n.id))
+    noteHitAnimRef.current.forEach((_, id) => {
+      if (!existing.has(id)) noteHitAnimRef.current.delete(id)
+    })
+  }, [notes])
+
+  const animateMagnetSeek = useCallback((fromSeek: number, toSeek: number) => {
+    const clampedFrom = isPlaying ? fromSeek : Math.max(0, fromSeek)
+    const clampedTo = isPlaying ? toSeek : Math.max(0, toSeek)
+
+    if (seekMagnetAnimRef.current !== null) {
+      cancelAnimationFrame(seekMagnetAnimRef.current)
+      seekMagnetAnimRef.current = null
+    }
+
+    const distance = clampedTo - clampedFrom
+    if (Math.abs(distance) < 0.0001) {
+      setSeekPos(clampedTo)
+      return
+    }
+
+    let direction = Math.sign(clampedTo - latestSeekPosRef.current)
+    if (direction === 0) direction = Math.sign(distance)
+    if (direction === 0) direction = lastMagnetDirectionRef.current
+    lastMagnetDirectionRef.current = direction
+
+    const start = performance.now()
+    const duration = 140
+    const overshoot = Math.abs(distance) * 0.12 * direction
+    const midTarget = clampedTo + overshoot
+    const easeOutCubic = (t: number) => 1 - Math.pow(1 - t, 3)
+
+    const step = (now: number) => {
+      const t = Math.min(1, (now - start) / duration)
+      let value = clampedTo
+
+      if (t < 0.65) {
+        const localT = t / 0.65
+        const eased = easeOutCubic(localT)
+        value = clampedFrom + (midTarget - clampedFrom) * eased
+      } else {
+        const localT = (t - 0.65) / 0.35
+        const eased = easeOutCubic(localT)
+        value = midTarget + (clampedTo - midTarget) * eased
+      }
+
+      setSeekPos(isPlaying ? value : Math.max(0, value))
+      if (t < 1) {
+        seekMagnetAnimRef.current = requestAnimationFrame(step)
+      } else {
+        setSeekPos(clampedTo)
+        seekMagnetAnimRef.current = null
+      }
+    }
+
+    seekMagnetAnimRef.current = requestAnimationFrame(step)
+  }, [isPlaying])
+
+  useEffect(() => {
+    return () => {
+      if (seekMagnetAnimRef.current !== null) {
+        cancelAnimationFrame(seekMagnetAnimRef.current)
+      }
+    }
+  }, [])
+
+  const jumpToMeasure = useCallback((measure: number) => {
+    const target = isPlaying ? Math.max(-leadInMeasures, measure) : Math.max(0, measure)
+    setSeekPos(target)
+    centerScrollOnSeek(target)
+  }, [isPlaying, leadInMeasures, centerScrollOnSeek])
+
+  const handleMeasureJump = useCallback(() => {
+    const parsed = Number(measureJumpInput)
+    if (!Number.isFinite(parsed)) return
+    jumpToMeasure(Math.trunc(parsed))
+  }, [measureJumpInput, jumpToMeasure])
 
   // Canvas Interactions
   const getCanvasPos = (e: React.MouseEvent) => {
@@ -1730,8 +2002,11 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
     // Seek interaction in header area
     if (y <= HEADER_HEIGHT) {
       setIsSeeking(true)
-      const { measure, pos } = getGridFromX(x)
-      setSeekPos(measure + pos / GRID_DIVISIONS)
+      const grid = getGridFromX(x)
+      const rawSeek = grid.rawMeasure + grid.rawPos / GRID_DIVISIONS
+      const snappedSeek = grid.measure + grid.pos / GRID_DIVISIONS
+      seekGestureRef.current = { startX: x, moved: false, rawSeek, snappedSeek }
+      setSeekPos(rawSeek)
       return
     }
 
@@ -1813,8 +2088,19 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
     setCurrentMouseX(e.clientX)
 
     if (isSeeking) {
-      const { measure, pos } = getGridFromX(x)
-      setSeekPos(measure + pos / GRID_DIVISIONS)
+      const grid = getGridFromX(x)
+      const rawSeek = grid.rawMeasure + grid.rawPos / GRID_DIVISIONS
+      const snappedSeek = grid.measure + grid.pos / GRID_DIVISIONS
+      if (seekGestureRef.current) {
+        if (Math.abs(x - seekGestureRef.current.startX) > 3) {
+          seekGestureRef.current.moved = true
+        }
+        seekGestureRef.current.rawSeek = rawSeek
+        seekGestureRef.current.snappedSeek = snappedSeek
+      } else {
+        seekGestureRef.current = { startX: x, moved: false, rawSeek, snappedSeek }
+      }
+      setSeekPos(rawSeek)
       return
     }
 
@@ -2001,6 +2287,12 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
 
     if (isSeeking) {
       setIsSeeking(false)
+      const gesture = seekGestureRef.current
+      if (gesture) {
+        // Single click and drag-end both magnetize only at the end.
+        animateMagnetSeek(gesture.rawSeek, gesture.snappedSeek)
+      }
+      seekGestureRef.current = null
       return
     }
 
@@ -2578,11 +2870,14 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
 
   const handleImportTja = async () => {
     try {
-      const result = tjaToGui(importTjaText)
+      const result = tjaToGui(importTjaFileText)
 
       // Update metadata
       setMetadata(result.metadata)
       saveMetadata(result.metadata)
+      tjaSourceRef.current = 'tja'
+      setTjaText(importTjaFileText)
+      setTjaDirty(false)
 
       // Clear existing notes and commands
       const oldNoteIds = notes.map(n => n.id)
@@ -2636,9 +2931,14 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
         await supabase.from('commands').insert(newCommands)
       }
 
+      if (roomSupportsTjaSource) {
+        await supabase.from('rooms').update({ tja_text: importTjaFileText }).eq('id', roomId)
+      }
+
       // Close modal and reset input
       setShowImportModal(false)
-      setImportTjaText('')
+      setImportTjaFileText('')
+      setImportTjaFileName('')
 
       // Notify others
       if (channelRef.current) {
@@ -2655,6 +2955,34 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
       alert('TJA インポートに失敗しました。ファイル形式を確認してください。')
     }
   }
+
+  const handleImportTjaFileChange = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    if (!file) {
+      setImportTjaFileText('')
+      setImportTjaFileName('')
+      return
+    }
+    if (!file.name.toLowerCase().endsWith('.tja')) {
+      alert('.tja ファイルを選択してください。')
+      e.target.value = ''
+      setImportTjaFileText('')
+      setImportTjaFileName('')
+      return
+    }
+    try {
+      const text = await file.text()
+      setImportTjaFileText(text)
+      setImportTjaFileName(file.name)
+    } catch (err) {
+      console.error('Failed to read .tja file:', err)
+      alert('.tja ファイルの読み込みに失敗しました。')
+      setImportTjaFileText('')
+      setImportTjaFileName('')
+    } finally {
+      e.target.value = ''
+    }
+  }, [])
 
   // Monaco Editor mount handler
   const handleEditorMount: OnMount = useCallback((editor, monaco) => {
@@ -2740,9 +3068,7 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
             className={`p-1.5 rounded transition-all ${historyIndexState < 0 ? 'opacity-30 cursor-not-allowed' : 'hover:bg-neutral-700 hover:text-white'}`}
             title="Undo (Ctrl+Z)"
             disabled={historyIndexState < 0}
-            onClick={() => {
-              const e = new KeyboardEvent('keydown', { ctrlKey: true, key: 'z' }); window.dispatchEvent(e);
-            }}
+            onClick={() => { void performUndo() }}
           >
             <Undo className="w-4 h-4" />
           </button>
@@ -2750,11 +3076,16 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
             className={`p-1.5 rounded transition-all ${historyIndexState >= historyLength - 1 ? 'opacity-30 cursor-not-allowed' : 'hover:bg-neutral-700 hover:text-white'}`}
             title="Redo (Ctrl+Y)"
             disabled={historyIndexState >= historyLength - 1}
-            onClick={() => {
-              const e = new KeyboardEvent('keydown', { ctrlKey: true, key: 'y' }); window.dispatchEvent(e);
-            }}
+            onClick={() => { void performRedo() }}
           >
             <Redo className="w-4 h-4" />
+          </button>
+          <button
+            className="p-1.5 rounded transition-all hover:bg-neutral-700 hover:text-white"
+            title="History"
+            onClick={() => setShowHistoryModal(true)}
+          >
+            <HistoryIcon className="w-4 h-4" />
           </button>
           <div className="w-px h-4 bg-neutral-700 mx-2"></div>
           <button className="p-1.5 hover:bg-neutral-700 rounded hover:text-white" title="Copy (Ctrl+C)" onClick={() => {
@@ -2878,6 +3209,12 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
               className="cursor-crosshair block w-full"
               style={{ height: `${HEADER_HEIGHT + LANE_HEIGHT}px` }}
             />
+            {isPlaying && (
+              <div className="pointer-events-none absolute inset-y-0 left-1/2 -translate-x-1/2 z-20">
+                <div className="absolute top-0 left-1/2 -translate-x-1/2 w-0 h-0 border-l-[6px] border-l-transparent border-r-[6px] border-r-transparent border-t-[10px] border-t-green-500" />
+                <div className="absolute top-0 bottom-0 left-1/2 -translate-x-1/2 w-[2px] bg-green-500" />
+              </div>
+            )}
           </div>
         </div>
       </div>
@@ -3069,6 +3406,24 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
           <span className="bg-neutral-900 px-2 py-1 rounded border border-neutral-700 font-mono">
             Seek: {(seekPos).toFixed(2)}
           </span>
+          <div className="flex items-center gap-1 bg-neutral-900 px-2 py-1 rounded border border-neutral-700">
+            <span className="text-neutral-400">Jump M</span>
+            <input
+              type="number"
+              value={measureJumpInput}
+              onChange={(e) => setMeasureJumpInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') handleMeasureJump()
+              }}
+              className="w-16 bg-neutral-950 border border-neutral-700 rounded px-1.5 py-0.5 text-[11px] text-white font-mono outline-none focus:border-orange-500"
+            />
+            <button
+              onClick={handleMeasureJump}
+              className="px-2 py-0.5 rounded bg-orange-600 hover:bg-orange-500 text-white text-[11px] font-semibold"
+            >
+              Go
+            </button>
+          </div>
           {remoteUsers.length > 0 && (
             <div className="flex items-center gap-2">
               {remoteUsers.map(u => (
@@ -3252,6 +3607,57 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
         </div>
       )}
 
+      {/* History Modal */}
+      {showHistoryModal && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm animate-in fade-in duration-200">
+          <div className="bg-neutral-900 border border-neutral-800 rounded-2xl p-6 w-full max-w-xl shadow-2xl animate-in zoom-in-95 duration-200">
+            <div className="flex items-center gap-3 mb-4">
+              <div className="w-10 h-10 rounded-lg bg-orange-500/10 border border-orange-500/20 flex items-center justify-center">
+                <HistoryIcon className="w-5 h-5 text-orange-400" />
+              </div>
+              <div>
+                <h3 className="text-lg font-bold text-white">History Timeline</h3>
+                <p className="text-xs text-neutral-400">Select an entry to jump to that edit state</p>
+              </div>
+            </div>
+
+            <div className="max-h-72 overflow-y-auto border border-neutral-800 rounded-lg divide-y divide-neutral-800 bg-neutral-950/60 mb-4">
+              {historyRef.current.length === 0 && (
+                <div className="px-4 py-6 text-sm text-neutral-500 text-center">No history entries yet</div>
+              )}
+              {[...historyRef.current].map((entry, idx) => {
+                const isCurrent = idx === historyIndexState
+                return (
+                  <button
+                    key={`${entry.createdAt}-${idx}`}
+                    onClick={() => { void jumpHistoryToIndex(idx) }}
+                    disabled={isHistoryJumping}
+                    className={`w-full text-left px-4 py-2.5 text-sm transition-colors ${isCurrent ? 'bg-orange-500/15 text-orange-200' : 'hover:bg-neutral-800 text-neutral-300'}`}
+                  >
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="font-semibold">{entry.label}</span>
+                      <span className="text-[11px] text-neutral-500">{new Date(entry.createdAt).toLocaleTimeString()}</span>
+                    </div>
+                    <div className="text-[11px] text-neutral-500 mt-0.5">
+                      #{(idx + 1).toString().padStart(2, '0')} {isCurrent ? 'Current' : ''}
+                    </div>
+                  </button>
+                )
+              })}
+            </div>
+
+            <div className="flex items-center justify-end gap-3">
+              <button
+                onClick={() => setShowHistoryModal(false)}
+                className="px-4 py-2 rounded-lg text-sm font-semibold text-neutral-400 hover:text-white hover:bg-neutral-800 transition-colors"
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Export TJA Modal */}
       {showExportDeleteModal && (
         <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm animate-in fade-in duration-200">
@@ -3315,22 +3721,30 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
               </div>
               <div>
                 <h3 className="text-lg font-bold text-white">Import TJA</h3>
-                <p className="text-xs text-neutral-400">Paste TJA source code to import</p>
+                <p className="text-xs text-neutral-400">Upload a .tja file to import</p>
               </div>
             </div>
 
-            <textarea
-              value={importTjaText}
-              onChange={e => setImportTjaText(e.target.value)}
-              placeholder="TITLE:&#10;BPM:120&#10;OFFSET:0&#10;COURSE:3&#10;LEVEL:10&#10;&#10;#START&#10;1234,&#10;#END"
-              className="w-full bg-neutral-950 border border-neutral-700 rounded-lg px-3 py-2 text-xs text-neutral-300 focus:border-green-500 outline-none transition-all mb-4 h-40 font-mono resize-none"
-            />
+            <label className="mb-4 flex h-32 w-full cursor-pointer flex-col items-center justify-center rounded-lg border border-dashed border-neutral-600 bg-neutral-950 px-3 py-2 text-center transition-all hover:border-green-500">
+              <input
+                type="file"
+                accept=".tja,text/plain"
+                className="hidden"
+                onChange={handleImportTjaFileChange}
+              />
+              <span className="text-sm font-semibold text-neutral-200">Select `.tja` file</span>
+              <span className="mt-1 text-xs text-neutral-500">Drag & drop is also supported by your browser</span>
+              <span className="mt-3 max-w-full truncate text-xs text-green-400">
+                {importTjaFileName || 'No file selected'}
+              </span>
+            </label>
 
             <div className="flex items-center gap-3 justify-end">
               <button
                 onClick={() => {
                   setShowImportModal(false)
-                  setImportTjaText('')
+                  setImportTjaFileText('')
+                  setImportTjaFileName('')
                 }}
                 className="px-4 py-2 rounded-lg text-sm font-semibold text-neutral-400 hover:text-white hover:bg-neutral-800 transition-colors"
               >
@@ -3338,7 +3752,7 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
               </button>
               <button
                 onClick={handleImportTja}
-                disabled={!importTjaText.trim()}
+                disabled={!importTjaFileText.trim()}
                 className="px-6 py-2 rounded-lg text-sm font-semibold bg-green-600 hover:bg-green-500 disabled:bg-neutral-700 disabled:text-neutral-500 text-white shadow-lg shadow-green-500/20 transition-all active:scale-95 flex items-center gap-2"
               >
                 <Copy className="w-4 h-4" />
@@ -3351,3 +3765,4 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
     </div>
   )
 }
+

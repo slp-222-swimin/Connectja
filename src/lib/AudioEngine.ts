@@ -11,6 +11,8 @@ class AudioEngine {
   private activeSESources = new Set<AudioBufferSourceNode>()
   private songGain: GainNode | null = null
   private seGain: GainNode | null = null
+  private seCompressor: DynamicsCompressorNode | null = null
+  private seBaseVolume = 1
 
   // Sound Effects
   public donBuffer: AudioBuffer | null = null
@@ -27,6 +29,7 @@ class AudioEngine {
   private scheduledNotes = new Set<string>() // prevent double scheduling
   private lookahead = 0.5 // Schedule 500ms ahead
   private scheduleInterval = 50 // ms
+  private scheduleBacklook = 0.03 // also catch notes slightly behind current time (start-edge safety)
 
   constructor() {
     this.initContext()
@@ -36,11 +39,19 @@ class AudioEngine {
     if (!this.ctx) {
       this.ctx = new (window.AudioContext || (window as any).webkitAudioContext)()
     }
-    if (this.ctx && (!this.songGain || !this.seGain)) {
+    if (this.ctx && (!this.songGain || !this.seGain || !this.seCompressor)) {
       this.songGain = this.ctx.createGain()
       this.seGain = this.ctx.createGain()
+      this.seCompressor = this.ctx.createDynamicsCompressor()
+      // Keep SE peaks under control when many hits overlap.
+      this.seCompressor.threshold.value = -14
+      this.seCompressor.knee.value = 10
+      this.seCompressor.ratio.value = 3.5
+      this.seCompressor.attack.value = 0.008
+      this.seCompressor.release.value = 0.06
       this.songGain.connect(this.ctx.destination)
-      this.seGain.connect(this.ctx.destination)
+      this.seGain.connect(this.seCompressor)
+      this.seCompressor.connect(this.ctx.destination)
     }
   }
 
@@ -50,6 +61,7 @@ class AudioEngine {
     const song = clamp(songVolume)
     const se = clamp(seVolume)
     if (this.songGain) this.songGain.gain.value = song
+    this.seBaseVolume = se
     if (this.seGain) this.seGain.gain.value = se
   }
 
@@ -168,14 +180,29 @@ class AudioEngine {
     if (!buffer) return
 
     const ctx = this.ctx!
+    // Simple polyphony cap to avoid pathological overload.
+    if (this.activeSESources.size >= 48) return
     const source = ctx.createBufferSource()
     source.buffer = buffer
     source.connect(this.seGain || ctx.destination)
     this.activeSESources.add(source)
+    const activeCount = this.activeSESources.size
+    if (this.seGain) {
+      // Gradually attenuate as simultaneous SE count rises.
+      const attenuation = 1 / Math.max(1, Math.pow(activeCount, 0.35))
+      const targetGain = Math.max(0.4, this.seBaseVolume * attenuation)
+      this.seGain.gain.setTargetAtTime(targetGain, ctx.currentTime, 0.01)
+    }
 
     const cleanup = () => {
       if (this.activeSESources.has(source)) {
         this.activeSESources.delete(source)
+      }
+      if (this.seGain) {
+        const afterCount = this.activeSESources.size
+        const attenuation = 1 / Math.max(1, Math.pow(Math.max(1, afterCount), 0.35))
+        const targetGain = Math.max(0.4, this.seBaseVolume * attenuation)
+        this.seGain.gain.setTargetAtTime(targetGain, ctx.currentTime, 0.025)
       }
       try {
         source.disconnect()
@@ -212,7 +239,8 @@ class AudioEngine {
   
   public startScheduler(
     getNotes: () => any[], 
-    getAbsoluteTime: (measure: number, pos: number) => number
+    getAbsoluteTime: (measure: number, pos: number) => number,
+    onNoteTriggered?: (noteId: string, scheduledAtCtxTime: number) => void
   ) {
     this.scheduledNotes.clear()
     if (this.schedulerTimer) clearInterval(this.schedulerTimer)
@@ -221,6 +249,7 @@ class AudioEngine {
       if (!this.isPlaying || !this.ctx) return
       
       const currentTime = this.getCurrentTime()
+      const scheduleFrom = currentTime - this.scheduleBacklook
       const scheduleUntil = currentTime + this.lookahead
       const notes = getNotes()
 
@@ -229,31 +258,42 @@ class AudioEngine {
         
         const noteTime = getAbsoluteTime(note.measure, note.position)
         
-          if (noteTime >= currentTime && noteTime <= scheduleUntil) {
+          if (noteTime >= scheduleFrom && noteTime <= scheduleUntil) {
             const ctx = this.ctx!
-            const scheduleAtCtxTime = ctx.currentTime + (noteTime - currentTime)
+            const scheduleAtCtxTime = Math.max(ctx.currentTime, ctx.currentTime + (noteTime - currentTime))
           
           if (note.type === '1' || note.type === '3') {
             this.playSE('don', scheduleAtCtxTime)
+            onNoteTriggered?.(note.id, scheduleAtCtxTime)
           } else if (note.type === '2' || note.type === '4') {
             this.playSE('ka', scheduleAtCtxTime)
+            onNoteTriggered?.(note.id, scheduleAtCtxTime)
           } else if (note.type === '5' || note.type === '6') {
             // Find end note
             const endNote = notes.find(n => n.type === '8' && (n.measure > note.measure || (n.measure === note.measure && n.position > note.position)))
             if (endNote) {
               const endTime = getAbsoluteTime(endNote.measure, endNote.position)
               const duration = endTime - noteTime
-              // schedule rolls every 20ms
-              const hits = Math.max(1, Math.floor(duration / 0.02))
+              // Schedule rolls every 80ms.
+              const intervalSec = 0.08
+              const hits = Math.max(1, Math.floor(duration / intervalSec) + 1)
               for (let i = 0; i < hits; i++) {
-                this.playSE('don', scheduleAtCtxTime + (i * 0.02))
+                this.playSE('don', scheduleAtCtxTime + (i * intervalSec))
               }
+              onNoteTriggered?.(note.id, scheduleAtCtxTime)
             }
           } else if (note.type === '7') {
-            const hits = note.attributes?.hits || 5
-            for (let i = 0; i < hits; i++) {
-              this.playSE('don', scheduleAtCtxTime + (i * 0.05)) // 5ms apart visually sounds like a burst or machine gun
+            const requestedHits = Math.max(1, Number(note.attributes?.hits) || 5)
+            const endNote = notes.find(n => n.type === '8' && (n.measure > note.measure || (n.measure === note.measure && n.position > note.position)))
+            const endTime = endNote ? getAbsoluteTime(endNote.measure, endNote.position) : noteTime
+            const duration = Math.max(0, endTime - noteTime)
+            const intervalSec = duration > 0 ? (duration / requestedHits) : 0.08
+            const actualHits = duration > 0 ? requestedHits : 1
+
+            for (let i = 0; i < actualHits; i++) {
+              this.playSE('don', scheduleAtCtxTime + (i * intervalSec))
             }
+            onNoteTriggered?.(note.id, scheduleAtCtxTime)
           }
 
           this.scheduledNotes.add(note.id)
