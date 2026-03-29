@@ -63,6 +63,31 @@ npm run build
 npm run preview
 ```
 
+## GitHub Pages Deploy
+
+このリポジトリは GitHub Pages で公開できるように設定済みです。
+
+### 手順
+
+1. GitHub リポジトリの `Settings` を開きます。
+2. `Pages` を選びます。
+3. `Build and deployment` の `Source` を `GitHub Actions` にします。
+4. `main` ブランチへ push すると、自動で `dist/` がデプロイされます。
+
+### 公開先
+
+通常は次の URL で公開されます。
+
+```text
+https://slp-222-swimin.github.io/Connectja/
+```
+
+### 注意
+
+- `vite.config.ts` の `base` は `/Connectja/` に設定済みです
+- GitHub Pages のリポジトリ名が変わったら `base` も合わせて変更してください
+- Supabase の環境変数は Pages のビルド時に必要です
+
 ## Supabase Schema
 
 `supabase/migrations/` に以下のマイグレーションがあります。
