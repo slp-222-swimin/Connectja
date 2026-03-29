@@ -87,6 +87,9 @@ https://slp-222-swimin.github.io/Connectja/
 - `vite.config.ts` の `base` は `/Connectja/` に設定済みです
 - GitHub Pages のリポジトリ名が変わったら `base` も合わせて変更してください
 - Supabase の環境変数は Pages のビルド時に必要です
+- GitHub の `Settings` → `Secrets and variables` → `Actions` に次を追加してください
+- `VITE_SUPABASE_URL`
+- `VITE_SUPABASE_ANON_KEY`
 
 ## Supabase Schema
 
