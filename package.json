@@ -8,7 +8,8 @@
     "dev": "vite",
     "electron:dev": "concurrently -k \"vite\" \"wait-on http://127.0.0.1:5173 && electron electron/main.mjs\"",
     "build": "tsc && vite build",
-    "electron:dist": "npm run build && electron-builder --win --x64",
+    "build:electron": "tsc && vite build --mode electron",
+    "electron:dist": "npm run build:electron && electron-builder --win --x64",
     "lint": "eslint . --ext ts,tsx --report-unused-disable-directives --max-warnings 0",
     "preview": "vite preview"
   },
@@ -43,18 +44,22 @@
   "build": {
     "appId": "com.connectja.app",
     "productName": "Connectja",
+    "icon": "logo.ico",
     "directories": {
       "output": "release"
     },
     "files": [
       "dist/**/*",
       "electron/**/*",
+      "logo.ico",
+      "logo.png",
       "package.json"
     ],
     "extraMetadata": {
       "main": "electron/main.mjs"
     },
     "win": {
+      "icon": "logo.ico",
       "target": [
         "nsis"
       ]

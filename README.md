@@ -1,123 +1,86 @@
 # Connectja
 
-Connectja は、Supabase Realtime を使って複数人で同時編集できる TJA スコアエディタです。  
-Monaco Editor ベースの TJA ソース編集と、キャンバス表示による視覚的な編集を組み合わせています。
+Connectja は、Supabase Realtime を使って複数人で同時編集できる TJA エディタです。  
+ブラウザ版（Vite）と、Windows 向け Electron 版の両方をサポートしています。
 
-## Features
+## 主な機能
+- リアルタイム共同編集（ノート/コマンド）
+- TJA Source 編集（Monaco Editor）
+- `.tja` のエクスポート / インポート（インポートはファイルアップロード方式）
+- BPM / HS / MEASURE / GOGOSTART / GOGOEND 編集
+- 音源アップロード（`.ogg`）と波形表示
+- 再生シーク、マグネット吸着、履歴ジャンプ（Undo/Redo履歴）
+- ノートヒット演出、連打/風船中の専用アニメーション
 
-- リアルタイム共同編集
-- Monaco Editor ベースの TJA ソース編集
-- キャンバス上でのノート配置とプレビュー
-- BPM, HS, SCROLL, MEASURE, GOGOSTART, GOGOEND などのコマンド対応
-- `.tja` のインポート / エクスポート
-- Supabase Storage を使った音源アップロード
-- ドラッグ操作とマウスホイールによる快適な編集
-
-## Tech Stack
-
+## 技術スタック
 - React 18 + TypeScript
 - Vite
 - Tailwind CSS
 - Monaco Editor
 - Supabase
-- Web Audio API
+- Electron（デスクトップ版）
 
-## Prerequisites
-
-- Node.js 18 以上
+## 必要環境
+- Node.js 18+
 - npm
 - Supabase プロジェクト
 
-## Setup
-
+## セットアップ
 ```bash
 npm install
 ```
 
-`.env` に Supabase の接続情報を設定します。
-
+`.env` を作成:
 ```env
 VITE_SUPABASE_URL=your-supabase-url
 VITE_SUPABASE_ANON_KEY=your-supabase-anon-key
 ```
 
-## Development
-
+## 開発（Web）
 ```bash
 npm run dev
 ```
 
-ローカルで `http://localhost:5173` を開いて動作確認します。
-
-## Production Build
-
+## ビルド（Web）
 ```bash
 npm run build
-```
-
-ビルド成果物は `dist/` に出力されます。
-
-プレビュー確認をしたい場合は次を実行します。
-
-```bash
 npm run preview
 ```
 
-## GitHub Pages Deploy
-
-このリポジトリは GitHub Pages で公開できるように設定済みです。
-
-### 手順
-
-1. GitHub リポジトリの `Settings` を開きます。
-2. `Pages` を選びます。
-3. `Build and deployment` の `Source` を `GitHub Actions` にします。
-4. `main` ブランチへ push すると、自動で `dist/` がデプロイされます。
-
-### 公開先
-
-通常は次の URL で公開されます。
-
-```text
-https://slp-222-swimin.github.io/Connectja/
+## Electron 版（Windows）
+### 開発起動
+```bash
+npm run electron:dev
 ```
 
-### 注意
+### 配布ビルド（インストーラー生成）
+```bash
+npm run electron:dist
+```
 
-- `vite.config.ts` の `base` は `/Connectja/` に設定済みです
-- GitHub Pages のリポジトリ名が変わったら `base` も合わせて変更してください
-- Supabase の環境変数は Pages のビルド時に必要です
-- GitHub の `Settings` → `Secrets and variables` → `Actions` に次を追加してください
-- `VITE_SUPABASE_URL`
-- `VITE_SUPABASE_ANON_KEY`
+補足:
+- Electron 配布ビルドは `vite build --mode electron`（`base: ./`）で実行されます。
+- 生成物は `release/` 配下に出力されます。
+- Releases に載せるのは通常 `Connectja Setup *.exe` のみでOKです。
 
-## Supabase Schema
+## アイコン
+- Electron アイコンは `logo.ico` を使用します。
+- `electron/main.mjs` と `package.json (build.icon / win.icon)` に設定済みです。
 
-`supabase/migrations/` に以下のマイグレーションがあります。
-
+## Supabase マイグレーション
+`supabase/migrations/` の SQL を順に適用してください。
 - `add_audio_support.sql`
 - `add_chart_volume_fields.sql`
 - `add_gogo_commands.sql`
 - `add_room_events.sql`
 - `add_room_password.sql`
 
-これらを Supabase に適用してから利用してください。
+## ディレクトリ概要
+- `src/components/Editor.tsx` : メインエディタ
+- `src/components/Lobby.tsx` : ルーム選択画面
+- `src/lib/tjaConverter.ts` : GUI/TJA 変換
+- `src/lib/AudioEngine.ts` : 再生 / SE / スケジューラ
+- `electron/main.mjs` : Electron メインプロセス
 
-## Project Structure
-
-- `src/components/Editor.tsx` - メインのエディタ画面
-- `src/components/Lobby.tsx` - ルーム一覧と参加 UI
-- `src/lib/tjaConverter.ts` - GUI と TJA 文字列の相互変換
-- `src/lib/tjaLanguage.ts` - Monaco 用の TJA 言語定義
-- `src/lib/AudioEngine.ts` - 再生と SE 制御
-- `supabase/migrations/` - DB スキーマとマイグレーション
-
-## Notes
-
-- 本番環境では `.env` を GitHub に含めないでください
-- 音源を使う機能には Supabase Storage の `audio` バケットが必要です
-- 共同編集機能には Realtime と各テーブルの RLS 設定が必要です
-
-## User Guide
-
-より詳しい使い方は [`howToUse.md`](./howToUse.md) を参照してください。
+## 操作ガイド
+詳細は [howToUse.md](./howToUse.md) を参照してください。
