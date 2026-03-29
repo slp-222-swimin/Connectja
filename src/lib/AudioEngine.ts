@@ -56,7 +56,7 @@ class AudioEngine {
   public async loadAudio(url: string) {
     this.initContext()
     if (!this.ctx) return
-    const res = await fetch(url)
+    const res = await fetch(url, { cache: 'no-store' })
     const arrayBuffer = await res.arrayBuffer()
     this.audioBuffer = await this.ctx.decodeAudioData(arrayBuffer)
   }

@@ -43,6 +43,16 @@ const HEADER_HEIGHT = 40
 const WAVEFORM_HEIGHT = 100
 const ZOOM_BASE_SCALE = 1.4
 
+const withCacheBuster = (url: string) => {
+  try {
+    const parsed = new URL(url, window.location.origin)
+    parsed.searchParams.set('v', Date.now().toString())
+    return parsed.toString()
+  } catch {
+    const separator = url.includes('?') ? '&' : '?'
+    return `${url}${separator}v=${Date.now()}`
+  }
+}
 export default function Editor({ roomId, userId, userName, userColor, onBack }: EditorProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const canvasRef = useRef<HTMLCanvasElement>(null)
@@ -654,7 +664,7 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
             prev.level === newRoom.level &&
             prev.sevol === newRoom.sevol &&
             prev.songvol === newRoom.songvol &&
-            audioUrl === newRoom.audio_url
+            prev.audio_url === newRoom.audio_url
           ) {
             return prev
           }
@@ -670,6 +680,20 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
             audio_url: newRoom.audio_url
           }
         })
+
+        const prevAudioUrl = stateRef.current.metadata?.audio_url ?? null
+        if (newRoom.audio_url !== prevAudioUrl) {
+          if (newRoom.audio_url) {
+            setAudioUrl(newRoom.audio_url)
+          } else {
+            setAudioUrl(null)
+            setAudioDuration(0)
+            setWaveformPeaks([])
+            audioEngine.audioBuffer = null
+            audioEngine.stop()
+            setIsPlaying(false)
+          }
+        }
 
         if (newRoom.tja_text && tjaSourceRef.current !== 'gui') {
           setTjaText(prev => prev === newRoom.tja_text ? prev : newRoom.tja_text)
@@ -862,17 +886,18 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
       if (error) throw error
 
       const { data: { publicUrl } } = supabase.storage.from('audio').getPublicUrl(fileName)
-      console.log('Got public URL:', publicUrl)
+      const versionedAudioUrl = withCacheBuster(publicUrl)
+      console.log('Got public URL:', versionedAudioUrl)
 
       // Update DB
-      const { error: dbError } = await supabase.from('rooms').update({ audio_url: publicUrl }).eq('id', roomId)
+      const { error: dbError } = await supabase.from('rooms').update({ audio_url: versionedAudioUrl }).eq('id', roomId)
 
       if (dbError) {
         console.error('Failed to update room audio_url:', dbError)
         throw dbError
       }
 
-      setAudioUrl(publicUrl)
+      setAudioUrl(versionedAudioUrl)
     } catch (err) {
       console.error('Audio upload failed:', err)
       alert('Failed to upload audio. Please ensure the file is a valid .ogg.')
