@@ -1,0 +1,3 @@
+-- Add chart volume metadata fields
+ALTER TABLE public.rooms ADD COLUMN IF NOT EXISTS sevol NUMERIC NOT NULL DEFAULT 100;
+ALTER TABLE public.rooms ADD COLUMN IF NOT EXISTS songvol NUMERIC NOT NULL DEFAULT 100;
