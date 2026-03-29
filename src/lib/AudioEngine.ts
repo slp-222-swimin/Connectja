@@ -65,9 +65,10 @@ class AudioEngine {
     this.initContext()
     if (!this.ctx) return
     try {
+      const seBaseUrl = import.meta.env.BASE_URL || '/'
       const [donRes, kaRes] = await Promise.all([
-        fetch('/snd/don.mp3'),
-        fetch('/snd/ka.mp3')
+        fetch(`${seBaseUrl}snd/don.mp3`),
+        fetch(`${seBaseUrl}snd/ka.mp3`)
       ])
       
       if (!donRes.ok || !kaRes.ok) {
