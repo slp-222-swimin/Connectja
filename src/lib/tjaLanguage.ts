@@ -20,9 +20,8 @@ export const tjaTokensProvider: languages.IMonarchLanguage = {
       // Comments
       [/\/\/.*$/, 'comment'],
 
-      // Chart commands (inside #START..#END)
-      [/#(START|END)\b/, 'keyword.control'],
-      [/#(BPMCHANGE|SCROLL|MEASURE|DELAY|GOGOSTART|GOGOEND|BARLINEOFF|BARLINEON|BRANCHSTART|BRANCHEND|N|E|M|LYRIC)\b/, 'keyword.command'],
+      // Chart commands and directives: color the whole line so note tokens do not leak through.
+      [/^#.*$/, 'keyword.command'],
 
       // Header lines - entire line is treated as a single token to prevent internal highlighting
       [/^(TITLE|SUBTITLE|BPM|WAVE|OFFSET|DEMOSTART|GENRE|MAKER|COURSE|LEVEL|BALLOON|SCOREINIT|SCOREDIFF|SCOREMODE|SONGVOL|SEVOL|HEADSCROLL|STYLE|EXAM1|EXAM2|EXAM3|GOGOSTART|GOGOEND)\s*:[^\n]*/, 'string'],

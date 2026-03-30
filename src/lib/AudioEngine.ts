@@ -82,7 +82,7 @@ class AudioEngine {
         fetch(`${seBaseUrl}snd/don.mp3`),
         fetch(`${seBaseUrl}snd/ka.mp3`)
       ])
-      
+
       if (!donRes.ok || !kaRes.ok) {
         console.warn(`Failed to fetch SE files: don:${donRes.status} ka:${kaRes.status}. Audio may be silent.`)
         return
@@ -90,20 +90,20 @@ class AudioEngine {
 
       const donArray = await donRes.arrayBuffer()
       const kaArray = await kaRes.arrayBuffer()
-      
+
       // Attempt to decode, but catch individual errors
       try {
         this.donBuffer = await this.ctx.decodeAudioData(donArray)
       } catch (e) {
         console.error('Error decoding don.mp3. Check if the file is a valid MP3.', e)
       }
-      
+
       try {
         this.kaBuffer = await this.ctx.decodeAudioData(kaArray)
       } catch (e) {
         console.error('Error decoding ka.mp3. Check if the file is a valid MP3.', e)
       }
-      
+
     } catch (e) {
       console.error('Failed to load or decode SEs:', e)
     }
@@ -112,7 +112,7 @@ class AudioEngine {
   public play(startSeconds: number, onEnded?: () => void) {
     this.initContext()
     if (!this.ctx) return
-    
+
     if (this.ctx.state === 'suspended') {
       this.ctx.resume()
     }
@@ -121,7 +121,7 @@ class AudioEngine {
 
     const ctx = this.ctx!
     this.startTime = ctx.currentTime
-    
+
     // Use startSeconds for timing calculations even if negative
     this.startSeekPos = startSeconds
 
@@ -139,8 +139,9 @@ class AudioEngine {
         return
       }
 
-      this.source.start(this.ctx.currentTime + delayInSeconds, safeStartSeconds)
-      
+      const playbackAdvanceSeconds = -0.03
+      this.source.start(Math.max(this.ctx.currentTime, this.ctx.currentTime + delayInSeconds - playbackAdvanceSeconds), safeStartSeconds)
+
       this.source.onended = () => {
         if (this.isPlaying) {
           this.isPlaying = false
@@ -236,18 +237,18 @@ class AudioEngine {
   }
 
   // --- Scheduler ---
-  
+
   public startScheduler(
-    getNotes: () => any[], 
+    getNotes: () => any[],
     getAbsoluteTime: (measure: number, pos: number) => number,
     onNoteTriggered?: (noteId: string, scheduledAtCtxTime: number) => void
   ) {
     this.scheduledNotes.clear()
     if (this.schedulerTimer) clearInterval(this.schedulerTimer)
-    
+
     this.schedulerTimer = window.setInterval(() => {
       if (!this.isPlaying || !this.ctx) return
-      
+
       const currentTime = this.getCurrentTime()
       const scheduleFrom = currentTime - this.scheduleBacklook
       const scheduleUntil = currentTime + this.lookahead
@@ -255,13 +256,13 @@ class AudioEngine {
 
       notes.forEach(note => {
         if (this.scheduledNotes.has(note.id)) return
-        
+
         const noteTime = getAbsoluteTime(note.measure, note.position)
-        
-          if (noteTime >= scheduleFrom && noteTime <= scheduleUntil) {
-            const ctx = this.ctx!
-            const scheduleAtCtxTime = Math.max(ctx.currentTime, ctx.currentTime + (noteTime - currentTime))
-          
+
+        if (noteTime >= scheduleFrom && noteTime <= scheduleUntil) {
+          const ctx = this.ctx!
+          const scheduleAtCtxTime = Math.max(ctx.currentTime, ctx.currentTime + (noteTime - currentTime))
+
           if (note.type === '1' || note.type === '3') {
             this.playSE('don', scheduleAtCtxTime)
             onNoteTriggered?.(note.id, scheduleAtCtxTime)

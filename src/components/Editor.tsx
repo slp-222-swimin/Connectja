@@ -56,6 +56,7 @@ const BASE_LEAD_IN_MEASURES = 1
 const NEGATIVE_LEAD_PADDING_MEASURES = 2 // buffer before chart start, per request
 const AUDIO_START_BASE_SECONDS = 0 // base audio start time; extendable if audio file has extra lead-in
 const PLAYBACK_START_PREROLL_SECONDS = 0.05 // start slightly earlier to avoid edge-note miss at play boundary
+const PLAYBACK_AUDIO_ADVANCE_SECONDS = 1.19 // waveform reference delay (existing 1.16 + 0.03)
 const DEFAULT_CHART_METADATA: TjaMetadata = {
   title: '',
   subtitle: '',
@@ -89,6 +90,7 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
   const containerRef = useRef<HTMLDivElement>(null)
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const editorRef = useRef<any>(null)
+  const editorDisposablesRef = useRef<any[]>([])
   const [notes, setNotes] = useState<Note[]>([])
   const [selectedType, setSelectedType] = useState<string>('1')
   const [roomName, setRoomName] = useState('')
@@ -154,6 +156,7 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
 
   // TJA Text Editor State
   const [tjaText, setTjaText] = useState('')
+  const [editorStatus, setEditorStatus] = useState({ line: 1, column: 1, totalLines: 1, totalChars: 0 })
   const [roomSupportsTjaSource, setRoomSupportsTjaSource] = useState(false)
   const tjaSourceRef = useRef<'gui' | 'tja' | null>(null)
   const [tjaDirty, setTjaDirty] = useState(false)
@@ -168,6 +171,7 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
   const [importTjaFileText, setImportTjaFileText] = useState('')
   const [importTjaFileName, setImportTjaFileName] = useState('')
   const [measureJumpInput, setMeasureJumpInput] = useState('0')
+  const editorStatusTickRef = useRef<number | null>(null)
   const initialSeekSyncedRef = useRef(false)
   const previousLeadInMeasuresRef = useRef(BASE_LEAD_IN_MEASURES)
   const lastAutoScrollLeftRef = useRef(0)
@@ -177,10 +181,25 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
   const lastMagnetDirectionRef = useRef(1)
   const seekGestureRef = useRef<{ startX: number, moved: boolean, rawSeek: number, snappedSeek: number } | null>(null)
   const noteHitAnimRef = useRef<Map<string, number>>(new Map()) // noteId -> AudioContext scheduled time
+  const lastSavedTjaTextRef = useRef('')
   const getSafeLastModifiedAt = useCallback((value: unknown) => {
     const n = Number(value)
     if (!Number.isFinite(n)) return 0
     return Math.min(n, Date.now() + 5000)
+  }, [])
+
+  const syncEditorStatus = useCallback(() => {
+    const editor = editorRef.current
+    if (!editor) return
+    const model = editor.getModel?.()
+    if (!model) return
+    const pos = editor.getPosition?.()
+    setEditorStatus({
+      line: pos?.lineNumber ?? 1,
+      column: pos?.column ?? 1,
+      totalLines: model.getLineCount(),
+      totalChars: model.getValueLength()
+    })
   }, [])
 
   const pushPresenceNotice = useCallback((message: string, color: string) => {
@@ -708,6 +727,7 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
           try {
             const parsed = tjaToGui(tjaSource)
             setTjaText(tjaSource)
+            lastSavedTjaTextRef.current = tjaSource
             setTjaDirty(false)
 
             // Map parsed notes/commands to GUI domain
@@ -1262,6 +1282,9 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
   // Keyboard Shortcuts
   useEffect(() => {
     const handleKeyDown = async (e: KeyboardEvent) => {
+      const isMonacoFocused = Boolean(editorRef.current?.hasTextFocus?.())
+      if (isMonacoFocused) return
+
       tjaSourceRef.current = 'gui'
       // Don't trigger shortcuts when typing in inputs
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return
@@ -1565,7 +1588,7 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
         for (let col = Math.floor(visibleStartX); col <= Math.ceil(visibleEndX); col += 2) {
           const grid = getGridFromX(col)
           const chartTime = getAbsoluteTime(grid.rawMeasure, grid.rawPos)
-          const audioTime = chartTime - metadata.offset
+          const audioTime = chartTime - metadata.offset - PLAYBACK_AUDIO_ADVANCE_SECONDS
           if (!Number.isFinite(audioTime) || audioTime < 0 || audioTime > duration) continue
 
           const peakIdx = Math.max(0, Math.min(
@@ -2785,8 +2808,8 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
       return
     }
 
-    setTjaText(newText)
-    setTjaDirty(true)
+      setTjaText(newText)
+      setTjaDirty(newText !== lastSavedTjaTextRef.current)
   }, [])
 
   // ── Explicit Save: parse TJA → update GUI + persist to Supabase ──
@@ -2861,6 +2884,7 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
         if (roomError) console.error('Error saving room TJA source:', roomError)
       }
 
+      lastSavedTjaTextRef.current = tjaText
       setTjaDirty(false)
 
       // Notify other clients to refresh their state (Notes/Commands/Metadata)
@@ -3063,13 +3087,41 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
 
     // Store editor instance for toolbar actions (copy/paste)
     editorRef.current = editor
+    editorDisposablesRef.current.forEach(d => d?.dispose?.())
+    editorDisposablesRef.current = []
 
     // Ctrl+S to save from editor
     editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => {
       handleTjaSave()
     })
+    editorDisposablesRef.current.push(
+      editor.onDidChangeCursorPosition(() => syncEditorStatus()),
+      editor.onDidChangeCursorSelection(() => syncEditorStatus()),
+      editor.onDidChangeModelContent(() => syncEditorStatus()),
+      editor.onDidFocusEditorWidget(() => syncEditorStatus())
+    )
+    syncEditorStatus()
 
-  }, [handleTjaSave])
+  }, [handleTjaSave, syncEditorStatus])
+
+  useEffect(() => {
+    if (editorStatusTickRef.current !== null) {
+      clearInterval(editorStatusTickRef.current)
+      editorStatusTickRef.current = null
+    }
+    editorStatusTickRef.current = window.setInterval(() => {
+      syncEditorStatus()
+    }, 120)
+
+    return () => {
+      if (editorStatusTickRef.current !== null) {
+        clearInterval(editorStatusTickRef.current)
+        editorStatusTickRef.current = null
+      }
+      editorDisposablesRef.current.forEach(d => d?.dispose?.())
+      editorDisposablesRef.current = []
+    }
+  }, [syncEditorStatus])
 
 
   return (
@@ -3382,6 +3434,15 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
             <div className="flex items-center gap-2 px-4 py-3 border-b border-neutral-700 shrink-0">
               <FileText className="w-4 h-4 text-cyan-400" />
               <h3 className="text-sm font-bold text-white tracking-tight uppercase">TJA Source</h3>
+              <span className="text-[10px] text-neutral-400 bg-neutral-900 px-2 py-0.5 rounded border border-neutral-700">
+                Line {editorStatus.line}
+              </span>
+              <span className="text-[10px] text-neutral-400 bg-neutral-900 px-2 py-0.5 rounded border border-neutral-700">
+                Ln {editorStatus.line}, Col {editorStatus.column}
+              </span>
+              <span className="text-[10px] text-neutral-400 bg-neutral-900 px-2 py-0.5 rounded border border-neutral-700">
+                {editorStatus.totalLines} lines / {editorStatus.totalChars} chars
+              </span>
               {tjaDirty && <span className="text-[10px] text-yellow-400 bg-yellow-500/10 px-2 py-0.5 rounded border border-yellow-500/30 animate-pulse">未保存</span>}
               <button
                 onClick={handleTjaSave}
