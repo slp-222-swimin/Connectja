@@ -9,6 +9,9 @@ const COLORS = [
   '#06b6d4', '#3b82f6', '#6366f1', '#a855f7', '#ec4899'
 ]
 
+const sanitizeDisplayName = (value: string) =>
+  value.trim().replace(/[<>"'`]/g, '').replace(/[\u0000-\u001f\u007f]/g, '').slice(0, 20)
+
 function App() {
   const [selectedRoomId, setSelectedRoomId] = useState<string | null>(null)
   const [userId] = useState<string>(() => {
@@ -30,15 +33,15 @@ function App() {
 
   const handleSetName = (e: React.FormEvent) => {
     e.preventDefault()
-    if (!userName.trim()) return
-    const normalized = userName.trim()
+    const normalized = sanitizeDisplayName(userName)
+    if (!normalized) return
     localStorage.setItem('connectja_username', normalized)
     setUserName(normalized)
     setIsNameSet(true)
   }
 
   const handleUpdateName = (nextName: string) => {
-    const normalized = nextName.trim()
+    const normalized = sanitizeDisplayName(nextName)
     if (!normalized) return
     localStorage.setItem('connectja_username', normalized)
     setUserName(normalized)

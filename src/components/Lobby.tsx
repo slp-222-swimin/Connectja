@@ -76,6 +76,7 @@ export default function Lobby({ userName, onChangeUserName, onSelectRoom }: Lobb
       setJoiningRoomId(room.id)
       const latestRoom = await fetchLatestRoom(room.id)
       if (!latestRoom.has_password) {
+        localStorage.removeItem(`connectja_room_password_${room.id}`)
         onSelectRoom(room.id)
         return
       }
@@ -98,6 +99,7 @@ export default function Lobby({ userName, onChangeUserName, onSelectRoom }: Lobb
       setRoomPasswordError(null)
       const latestRoom = await fetchLatestRoom(passwordRoom.id)
       if (!latestRoom.has_password) {
+        localStorage.removeItem(`connectja_room_password_${passwordRoom.id}`)
         setPasswordRoom(null)
         onSelectRoom(passwordRoom.id)
         return
@@ -117,6 +119,7 @@ export default function Lobby({ userName, onChangeUserName, onSelectRoom }: Lobb
         return
       }
 
+      localStorage.setItem(`connectja_room_password_${passwordRoom.id}`, roomPasswordInput)
       setPasswordRoom(null)
       onSelectRoom(passwordRoom.id)
     } catch (err: any) {

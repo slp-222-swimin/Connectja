@@ -1,5 +1,5 @@
 ﻿import { useEffect, useRef, useState, useLayoutEffect, useMemo, useCallback } from 'react'
-import { supabase } from '../lib/supabase'
+import { createRoomScopedSupabase } from '../lib/supabase'
 import { ArrowLeft, Save, Users, Settings, Info, Trash2, Undo, Redo, Copy, ClipboardPaste, ZoomIn, ZoomOut, Play, AlertTriangle, FileText, Download, History as HistoryIcon } from 'lucide-react'
 import { guiToTja, tjaToGui, type TjaNote, type TjaCommand, type TjaMetadata } from '../lib/tjaConverter'
 import MonacoEditor, { type OnMount } from '@monaco-editor/react'
@@ -77,7 +77,15 @@ const withCacheBuster = (url: string) => {
     return `${url}${separator}v=${Date.now()}`
   }
 }
+
+const sanitizeUserFacingText = (value: unknown, fallback = 'Unknown') => {
+  const raw = String(value ?? '').trim()
+  if (!raw) return fallback
+  return raw.replace(/[<>"'`]/g, '').replace(/[\u0000-\u001f\u007f]/g, '').slice(0, 40) || fallback
+}
+
 export default function Editor({ roomId, userId, userName, userColor, onBack }: EditorProps) {
+  const supabase = useMemo(() => createRoomScopedSupabase(roomId), [roomId])
   const containerRef = useRef<HTMLDivElement>(null)
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const editorRef = useRef<any>(null)
@@ -169,6 +177,11 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
   const lastMagnetDirectionRef = useRef(1)
   const seekGestureRef = useRef<{ startX: number, moved: boolean, rawSeek: number, snappedSeek: number } | null>(null)
   const noteHitAnimRef = useRef<Map<string, number>>(new Map()) // noteId -> AudioContext scheduled time
+  const getSafeLastModifiedAt = useCallback((value: unknown) => {
+    const n = Number(value)
+    if (!Number.isFinite(n)) return 0
+    return Math.min(n, Date.now() + 5000)
+  }, [])
 
   const pushPresenceNotice = useCallback((message: string, color: string) => {
     const id = crypto.randomUUID()
@@ -188,7 +201,7 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
       users.push({
         key,
         userId: pid,
-        userName: String(p.userName || 'Unknown'),
+        userName: sanitizeUserFacingText(p.userName, 'Unknown'),
         userColor: String(p.userColor || '#888'),
         seekPos: typeof p.seekPos === 'number' ? p.seekPos : 0
       })
@@ -596,7 +609,7 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
         payload: { commands: upsertedCmds }
       })
     }
-  }, [roomId])
+  }, [roomId, onBack, supabase, userId])
 
   const broadcastCommandDelete = useCallback((cmdIds: string[]) => {
     if (channelRef.current && cmdIds.length > 0) {
@@ -644,11 +657,34 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
   const initData = useCallback(async () => {
     try {
       // Fetch room first so TJA source can be treated as the primary source of truth on join.
-      const { data: roomData, error: roomError } = await supabase.from('rooms').select('*').eq('id', roomId).single()
+      const { data: roomData, error: roomError } = await supabase
+        .from('rooms')
+        .select('id, display_name, title, subtitle, offset, difficulty, level, sevol, songvol, audio_url, tja_text, has_password')
+        .eq('id', roomId)
+        .single()
       if (roomError) throw roomError
 
       if (roomData) {
-        setRoomName(roomData.display_name)
+        if ((roomData as any).has_password) {
+          const candidatePassword = localStorage.getItem(`connectja_room_password_${roomId}`) || ''
+          if (!candidatePassword) {
+            alert('このルームはパスワードが必要です。ロビーから入室してください。')
+            onBack()
+            return
+          }
+          const { data: ok, error: verifyError } = await supabase.rpc('verify_room_password', {
+            target_room_id: roomId,
+            candidate_password: candidatePassword
+          })
+          if (verifyError || !ok) {
+            localStorage.removeItem(`connectja_room_password_${roomId}`)
+            alert('パスワード認証に失敗しました。ロビーから再入室してください。')
+            onBack()
+            return
+          }
+        }
+
+        setRoomName(sanitizeUserFacingText(roomData.display_name, roomId))
         setMetadata({
           title: roomData.title || '',
           subtitle: roomData.subtitle || '',
@@ -748,7 +784,7 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
       .on('broadcast', { event: 'room_notice' }, (message: any) => {
         const payload = message?.payload ?? message
         if (!payload || payload.userId === userId) return
-        const actorName = String(payload.userName || 'Unknown')
+        const actorName = sanitizeUserFacingText(payload.userName, 'Unknown')
         const actorColor = String(payload.userColor || '#888')
         const action = String(payload.action || '')
         if (action === 'join') {
@@ -821,7 +857,7 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
             let next = [...prev]
             for (const newNote of newNotes) {
               const existing = next.find(n => n.id === newNote.id)
-              if (existing && (existing.last_modified_at ?? 0) >= (newNote.last_modified_at ?? 0)) continue
+              if (existing && getSafeLastModifiedAt(existing.last_modified_at) >= getSafeLastModifiedAt(newNote.last_modified_at)) continue
               next = [...next.filter(n => n.id !== newNote.id), newNote]
             }
             return next
@@ -836,7 +872,7 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
             let next = [...prev]
             for (const newCmd of newCmds) {
               const existing = next.find(c => c.id === newCmd.id)
-              if (existing && (existing.last_modified_at ?? 0) >= (newCmd.last_modified_at ?? 0)) continue
+              if (existing && getSafeLastModifiedAt(existing.last_modified_at) >= getSafeLastModifiedAt(newCmd.last_modified_at)) continue
               next = [...next.filter(c => c.id !== newCmd.id), newCmd]
             }
             return next
@@ -865,7 +901,7 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
         if ((payload.new as Note).last_modified_by === userId) return
         setNotes(prev => {
           const existing = prev.find(n => n.id === payload.new.id)
-          if (existing && (existing.last_modified_at ?? 0) >= ((payload.new as Note).last_modified_at ?? 0)) return prev
+          if (existing && getSafeLastModifiedAt(existing.last_modified_at) >= getSafeLastModifiedAt((payload.new as Note).last_modified_at)) return prev
           return [...prev.filter(n => n.id !== payload.new.id), payload.new as Note]
         })
       })
@@ -873,7 +909,7 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
         if ((payload.new as Note).last_modified_by === userId) return
         setNotes(prev => {
           const existing = prev.find(n => n.id === payload.new.id)
-          if (existing && (existing.last_modified_at ?? 0) >= ((payload.new as Note).last_modified_at ?? 0)) return prev
+          if (existing && getSafeLastModifiedAt(existing.last_modified_at) >= getSafeLastModifiedAt((payload.new as Note).last_modified_at)) return prev
           return prev.map(n => n.id === payload.new.id ? payload.new as Note : n)
         })
       })
@@ -883,13 +919,13 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
 
     channel.subscribe(async (status) => {
       if (status === 'SUBSCRIBED') {
-        await channel.track({ userId, userName, userColor, seekPos })
-        const { error: joinEventError } = await supabase.from('room_events').insert({
-          room_id: roomId,
-          event_type: 'join',
-          user_id: userId,
-          user_name: userName,
-          user_color: userColor
+        await channel.track({ userId, userName: sanitizeUserFacingText(userName, 'Unknown'), userColor, seekPos })
+        const { error: joinEventError } = await supabase.rpc('log_room_event', {
+          target_room_id: roomId,
+          event_kind: 'join',
+          target_user_id: userId,
+          target_user_name: sanitizeUserFacingText(userName, 'Unknown'),
+          target_user_color: userColor
         })
         if (joinEventError) {
           console.warn('room_events join insert failed:', joinEventError)
@@ -900,7 +936,7 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
           payload: {
             action: 'join',
             userId,
-            userName,
+            userName: sanitizeUserFacingText(userName, 'Unknown'),
             userColor
           }
         })
@@ -934,16 +970,16 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
         payload: {
           action: 'leave',
           userId,
-          userName,
+          userName: sanitizeUserFacingText(userName, 'Unknown'),
           userColor
         }
       })
-      void supabase.from('room_events').insert({
-        room_id: roomId,
-        event_type: 'leave',
-        user_id: userId,
-        user_name: userName,
-        user_color: userColor
+      void supabase.rpc('log_room_event', {
+        target_room_id: roomId,
+        event_kind: 'leave',
+        target_user_id: userId,
+        target_user_name: sanitizeUserFacingText(userName, 'Unknown'),
+        target_user_color: userColor
       })
       supabase.removeChannel(channel)
       supabase.removeChannel(cmdChannel)
@@ -953,7 +989,7 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
   // Broadcast seek position to presence whenever it changes
   useEffect(() => {
     if (!channelRef.current) return
-    void channelRef.current.track({ userId, userName, userColor, seekPos })
+    void channelRef.current.track({ userId, userName: sanitizeUserFacingText(userName, 'Unknown'), userColor, seekPos })
   }, [seekPos, userId, userName, userColor])
 
   useEffect(() => {
