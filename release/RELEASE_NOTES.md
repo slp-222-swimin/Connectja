@@ -1,5 +1,3 @@
-# Connectja Release Notes
-
 ## v0.1.3
 
 ### Added

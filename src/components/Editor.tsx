@@ -57,6 +57,7 @@ const NEGATIVE_LEAD_PADDING_MEASURES = 2 // buffer before chart start, per reque
 const AUDIO_START_BASE_SECONDS = 0 // base audio start time; extendable if audio file has extra lead-in
 const PLAYBACK_START_PREROLL_SECONDS = 0.05 // start slightly earlier to avoid edge-note miss at play boundary
 const PLAYBACK_AUDIO_ADVANCE_SECONDS = 1.19 // waveform reference delay (existing 1.16 + 0.03)
+const IS_ELECTRON = typeof navigator !== 'undefined' && navigator.userAgent.includes('Electron')
 const DEFAULT_CHART_METADATA: TjaMetadata = {
   title: '',
   subtitle: '',
@@ -1588,7 +1589,7 @@ export default function Editor({ roomId, userId, userName, userColor, onBack }: 
         for (let col = Math.floor(visibleStartX); col <= Math.ceil(visibleEndX); col += 2) {
           const grid = getGridFromX(col)
           const chartTime = getAbsoluteTime(grid.rawMeasure, grid.rawPos)
-          const audioTime = chartTime - metadata.offset - PLAYBACK_AUDIO_ADVANCE_SECONDS
+          const audioTime = chartTime - metadata.offset - (IS_ELECTRON ? 0 : PLAYBACK_AUDIO_ADVANCE_SECONDS)
           if (!Number.isFinite(audioTime) || audioTime < 0 || audioTime > duration) continue
 
           const peakIdx = Math.max(0, Math.min(
